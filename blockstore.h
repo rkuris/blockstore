@@ -36,11 +36,17 @@ int add_block(struct Store *store, struct Block *block);
  * - `store` is a valid pointer returned by `new_store`
  * - `store` has not been freed before
  * - No other references to `store` exist
+ *
+ * # Panics
+ * Panics if the safety lock cannot be acquired.
  */
 void free_store(struct Store *store);
 
 /**
  * Retrieves a block by its ID.
+ *
+ * If the block cannot be found, it returns a block with a
+ * zero length and null pointer.
  *
  * # Safety
  * The caller must ensure that the returned `Block`'s `data` field is properly managed
@@ -49,7 +55,7 @@ void free_store(struct Store *store);
  * # Panics
  * Panics if `store` is a null pointer.
  */
-struct Block get_block(struct Store *store, uint64_t id);
+struct Block get_block(const struct Store *store, uint64_t id);
 
 /**
  * Creates a new store instance.
