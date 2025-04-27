@@ -1,6 +1,25 @@
 # Blockstore
 
-A Rust library with Go bindings for storing blocks of data.
+A Rust library with Go bindings for storing blocks of data, optimized for blockchain blocks.
+
+Blocks may be received out of order, but we still write the blocks as we receive them.
+
+To find blocks, we maintain a LRU cache. We add to the cache whenever we write a block to disk,
+as it's likely someone will be requesting that block soon. However, there are two cases to
+consider:
+
+- A new process starts up and wants to start streaming blocks from some recent point in time.
+   The cache should work fine here, because entries created much later will disappear from the
+   cache sooner.
+
+- A new process starts up and wants blocks from the beginning of time. Since these will be read
+  from disk and they will be out of order, we should be caching entries that are larger than the
+  on requested, since they are likely to be requested soon. We handle this by caching blocks we
+  happen to see while reading a chunk.
+
+We could do a lot better here. Since the chunk we're reading probably contains some additional blocks
+we are likely to want, we should keep reading the chunk and cache some additional entries, or at least
+remember where we left off so we can resume from there on the next read.
 
 ## Building the Rust Library
 

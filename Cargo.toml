@@ -2,13 +2,34 @@
 name = "blockstore_ffi"
 version = "0.1.0"
 edition = "2024"
+description = "A simple blockchain block store in Rust"
+authors = ["Ron Kuris <swcafe@gmail.com>"]
+keywords = ["blockchain", "blockstore", "blockchain-storage"]
+categories = ["database-implementations"]
+repository = "https://github.com/rkuris/blockstore"
+license-file = "LICENSE.md"
+readme = "README.md"
 
 [lib]
 crate-type = ["staticlib"]
+
 [dependencies]
+bincode = "2.0.1"
+lru = "0.14.0"
+more-asserts = "0.3.1"
 
 [build-dependencies]
 cbindgen = "0.28.0"
 
 [lints.clippy]
-pedantic = "deny"
+pedantic = "warn"
+all = "warn"
+cargo = "warn"
+absolute-paths = "warn"
+arithmetic-side-effects = "warn"
+indexing-slicing = "warn"
+get-unwrap = "warn"
+exit = "warn"
+dbg-macro = "warn"
+decimal-literal-representation = "warn"
+

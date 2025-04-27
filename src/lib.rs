@@ -1,20 +1,78 @@
-use std::collections::HashMap;
-use std::ffi::c_int;
 use std::fmt::{self, Display};
-use std::sync::RwLock;
+use std::io::Error;
+use std::num::NonZeroU64;
+use std::slice::from_raw_parts;
+use std::ptr::null;
 
-pub struct Store {
-    data: HashMap<u64, Block>,
+use bincode::{Decode, Encode, config};
+
+pub mod ffi;
+pub mod store;
+
+type BlockId = NonZeroU64;
+
+#[derive(Debug, Copy, Clone, Encode, Decode)]
+#[repr(C)]
+pub struct BlockHeader {
+    pub id: BlockId,
+    pub len: usize,
 }
 
-static SAFETY_LOCK: RwLock<()> = RwLock::new(());
+const BINCODE_CONFIG: config::Configuration<config::LittleEndian, config::Fixint, config::NoLimit> =
+    config::legacy();
+
+impl BlockHeader {
+    /// Encodes the block header into bytes.
+    ///
+    /// # Panics
+    /// Panics if:
+    /// - The header data exceeds bincode's size limits (should never happen)
+    /// - The header contains invalid data that cannot be serialized    
+    #[must_use]
+    pub fn as_bytes(&self) -> Box<[u8]> {
+        // TODO: use a more efficient encoding method
+        bincode::encode_to_vec(self, BINCODE_CONFIG)
+            .unwrap()
+            .into_boxed_slice()
+    }
+
+    /// Decodes a block header from bytes.
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - The input bytes are not a valid block header
+    /// - The input bytes are too short
+    /// - The decoded data is invalid
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        // TODO: use a more efficient decoding method
+        let (header, _) =
+            bincode::borrow_decode_from_slice::<BlockHeader, _>(bytes, BINCODE_CONFIG)
+                .map_err(Error::other)?;
+        Ok(header)
+    }
+}
 
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
 pub struct Block {
-    pub id: u64,
-    pub len: usize,
+    pub header: BlockHeader,
     pub data: *const u8,
+}
+impl Block {
+    /// Encodes the block into bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> Box<[u8]> {
+        let data_slice = unsafe { from_raw_parts(self.data, self.header.len) };
+        self.header
+            .id
+            .get()
+            .to_ne_bytes()
+            .iter()
+            .chain(self.header.len.to_ne_bytes().iter())
+            .chain(data_slice.iter())
+            .copied()
+            .collect()
+    }
 }
 
 impl Display for Block {
@@ -22,7 +80,7 @@ impl Display for Block {
         write!(
             f,
             "Block {{ id: {}, len: {}, data: {:?} }}",
-            self.id, self.len, self.data
+            self.header.id, self.header.len, self.data
         )
     }
 }
@@ -30,74 +88,11 @@ impl Display for Block {
 impl Default for Block {
     fn default() -> Self {
         Block {
-            id: 0,
-            len: 0,
-            data: std::ptr::null(),
+            header: BlockHeader {
+                id: BlockId::MAX,
+                len: 0,
+            },
+            data: null(),
         }
     }
-}
-
-/// Adds a block to the store.
-///
-/// Returns 0 on success, or an error code on failure.
-///
-/// # Safety
-/// The caller must ensure that:
-/// - `block` is a valid pointer to a `Block` structure
-/// - The `data` field of the `Block` points to valid memory for the specified `len`
-///
-/// # Panics
-/// Panics if `store` or `block` is a null pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn add_block(store: *mut Store, block: *mut Block) -> c_int {
-    let _guard = SAFETY_LOCK.write().unwrap();
-    let store = unsafe { store.as_mut().unwrap() };
-    let block = unsafe { block.as_ref().unwrap() };
-    store.data.insert(block.id, *block);
-    0
-}
-
-/// Retrieves a block by its ID.
-///
-/// If the block cannot be found, it returns a block with a
-/// zero length and null pointer.
-///
-/// # Safety
-/// The caller must ensure that the returned `Block`'s `data` field is properly managed
-/// and that the memory it points to remains valid for the duration of its use.
-///
-/// # Panics
-/// Panics if `store` is a null pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn get_block(store: *const Store, id: u64) -> Block {
-    let _guard = SAFETY_LOCK.read().unwrap();
-    let store = unsafe { store.as_ref().unwrap() };
-    *store.data.get(&id).unwrap_or(&Block::default())
-}
-
-/// Creates a new store instance.
-///
-/// # Safety
-/// The caller must ensure to call `free_store` on the returned pointer when done.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn new_store() -> *mut Store {
-    Box::into_raw(Box::new(Store {
-        data: HashMap::new(),
-    }))
-}
-
-/// Frees a store instance.
-///
-/// # Safety
-/// The caller must ensure:
-/// - `store` is a valid pointer returned by `new_store`
-/// - `store` has not been freed before
-/// - No other references to `store` exist
-///
-/// # Panics
-/// Panics if the safety lock cannot be acquired.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn free_store(store: *mut Store) {
-    let _guard = SAFETY_LOCK.write().unwrap();
-    drop(unsafe { Box::from_raw(store) });
 }
