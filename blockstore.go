@@ -1,6 +1,7 @@
 package blockstore
 
 import (
+	"errors"
 	"runtime"
 	"unsafe"
 )
@@ -11,12 +12,12 @@ import (
 import "C"
 
 type Block struct {
-	Id   uint64
-	Data []byte
+	Height uint64
+	Data   []byte
 }
 
 type Store struct {
-	handle *C.FfiStore
+	handle *C.struct_Store
 }
 
 func NewStore(path string) *Store {
@@ -31,24 +32,27 @@ func NewStore(path string) *Store {
 	}
 }
 
-func (s *Store) AddBlock(block Block) int {
+func (s *Store) WriteBlock(block Block) error {
 	pinner := runtime.Pinner{}
 	pinner.Pin(&block.Data[0])
 	defer pinner.Unpin()
 
-	cBlock := C.Block{
-		header: C.BlockHeader{
-			id:   C.uint64_t(block.Id),
-			len:  C.size_t(len(block.Data)),
-		},
-		data: (*C.uint8_t)(&block.Data[0]),
+	result := C.write_block(s.handle, C.uint64_t(block.Height), C.size_t(len(block.Data)), (*C.uchar)(unsafe.SliceData(block.Data)))
+	if result != nil {
+		return errors.New(C.GoString(result))
 	}
-	return int(C.add_block(s.handle, cBlock))
+	return nil
 }
 
-func (s *Store) GetBlock(id uint64) []byte {
-	cBlock := C.get_block(s.handle, C.uint64_t(id))
-	return C.GoBytes(unsafe.Pointer(cBlock.data), C.int(cBlock.header.len))
+func (s *Store) ReadBlock(id uint64) ([]byte, error) {
+	cBlock := C.read_block(s.handle, C.uint64_t(id))
+	if cBlock.len == 0 {
+		if cBlock.data == nil {
+			return nil, nil
+		}
+		return nil, errors.New(C.GoString((*C.char)(unsafe.Pointer(cBlock.data))))
+	}
+	return C.GoBytes(unsafe.Pointer(cBlock.data), C.int(cBlock.len)), nil
 }
 
 func (s *Store) Close() {

@@ -1,19 +1,19 @@
 package blockstore
 
 import (
-	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
-func TestAddBlock(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "test.db")
-	store := NewStore(dbPath)
-	assert.Equal(t, 0, store.AddBlock(Block{
-		Id:   1,
-		Data: []byte("test"),
+func TestSmoke(t *testing.T) {
+	store := NewStore("test.db")
+	assert.Equal(t, nil, store.WriteBlock(Block{
+		Height: 1,
+		Data:   []byte("test"),
 	}))
 
-	assert.Equal(t, []byte("test"), store.GetBlock(1))
+	block, err := store.ReadBlock(1)
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("test"), block)
 }

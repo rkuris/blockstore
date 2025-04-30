@@ -1,12 +1,11 @@
-use std::ffi::{CStr, OsStr, c_char, c_int};
+use std::ffi::{CStr, CString, OsStr, c_char};
 use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
-use std::ptr;
-use std::sync::RwLock;
+use std::{ptr, slice};
 
-use super::store;
-use crate::{Block, BlockId};
+use crate::store::Store;
+use crate::BlockHeight;
 
 #[repr(C)]
 #[allow(clippy::arbitrary_source_item_ordering)]
@@ -14,18 +13,6 @@ pub struct CreateOrOpenArgs {
     path: *const c_char,
     cache_size: usize,
     truncate: bool,
-}
-
-#[derive(Debug)]
-pub struct FfiStore {
-    /// This lock is used to ensure that the FFI functions
-    /// instantiate the store from the raw pointer without
-    /// violating Rust's safety guarantees. When dereferencing
-    /// the raw pointer to create a mutable reference, we
-    /// need to ensure that no other references to the store
-    /// exist, and for immutable references, we need to ensure
-    /// that no mutable references exist.
-    inner: RwLock<store::Store>,
 }
 
 /// Adds a block to the store.
@@ -42,20 +29,32 @@ pub struct FfiStore {
 /// # Panics
 /// Panics if `store` or `block` is a null pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn add_block(store: *mut FfiStore, block: Block) -> c_int {
-    let store = unsafe { store.as_mut().unwrap() };
-    let mut guard = store.inner.write().unwrap();
-
-    match guard.insert(block) {
-        Err(_) => 1,
-        Ok(()) => 0,
+pub unsafe extern "C" fn write_block(
+    store: *const Store,
+    height: BlockHeight,
+    block_len: usize,
+    block_data: *const u8,
+) -> *const c_char {
+    let store = unsafe { store.as_ref().unwrap() };
+    let block = unsafe { slice::from_raw_parts(block_data, block_len) };
+    match store.write_block(height, block) {
+        Ok(()) => ptr::null(),
+        // TODO: error strings leak memory :()
+        Err(e) => CString::new(e.to_string()).unwrap().into_raw(),
     }
+}
+
+#[repr(C)]
+pub struct FfiBlock {
+    data: *mut u8,
+    len: usize,
 }
 
 /// Retrieves a block by its ID.
 ///
 /// If the block cannot be found, it returns a block with a
-/// zero length and null pointer.
+/// zero length and null pointer. If an error occurs, it returns
+/// a C string containing the error message and a zero size.
 ///
 /// # Safety
 /// The caller must ensure that `store` is a valid pointer to a `FfiStore` instance.
@@ -63,11 +62,39 @@ pub unsafe extern "C" fn add_block(store: *mut FfiStore, block: Block) -> c_int 
 /// # Panics
 /// Panics if `store` is a null pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn get_block(store: *const FfiStore, id: BlockId) -> Block {
+pub unsafe extern "C" fn read_block(store: *const Store, id: BlockHeight) -> FfiBlock {
     let store = unsafe { store.as_ref().unwrap() };
-    let guard = store.inner.read().unwrap();
-    // TODO: don't swallow the error
-    guard.block(id).unwrap_or(None).unwrap_or(Block::default())
+    match store.read_block(id) {
+        Ok(Some(block)) => {
+            let leaked = Box::leak(block);
+            FfiBlock {
+                data: leaked.as_mut_ptr(),
+                len: leaked.len(),
+            }
+        }
+        Ok(None) => FfiBlock {
+            data: ptr::null_mut(),
+            len: 0,
+        },
+        Err(e) => FfiBlock {
+            data: CString::new(e.to_string()).unwrap().into_raw().cast::<u8>(),
+            len: 0,
+        },
+    }
+}
+
+/// Frees a previous return from `read_block`.
+///
+/// # Safety
+/// The caller must ensure that `data` is a valid pointer to a block.
+///
+/// # Panics
+/// Panics if `data` is a null pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn free_block(block: FfiBlock) {
+    let slice = unsafe { slice::from_raw_parts_mut(block.data, block.len) };
+    let boxed = unsafe { Box::from_raw(slice) };
+    drop(boxed);
 }
 
 /// Creates a new store instance. Returns a pointer to the store, or null if the store cannot be created.
@@ -78,7 +105,7 @@ pub unsafe extern "C" fn get_block(store: *const FfiStore, id: BlockId) -> Block
 /// # Panics
 /// Panics if `args` is a null pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn new_store(args: CreateOrOpenArgs) -> *mut FfiStore {
+pub unsafe extern "C" fn new_store(args: CreateOrOpenArgs) -> *const Store {
     let path = unsafe { CStr::from_ptr(args.path) };
     let path: &Path = OsStr::from_bytes(path.to_bytes()).as_ref();
 
@@ -88,10 +115,8 @@ pub unsafe extern "C" fn new_store(args: CreateOrOpenArgs) -> *mut FfiStore {
         return ptr::null_mut();
     };
 
-    match store::Store::new(path, cache_size, truncate) {
-        Ok(store) => Box::into_raw(Box::new(FfiStore {
-            inner: store.into(),
-        })),
+    match Store::new(path, path, cache_size, truncate) {
+        Ok(store) => Box::into_raw(Box::new(store)),
         Err(_) => ptr::null_mut(),
     }
 }
@@ -107,6 +132,6 @@ pub unsafe extern "C" fn new_store(args: CreateOrOpenArgs) -> *mut FfiStore {
 /// # Panics
 /// Panics if the safety lock cannot be acquired.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn free_store(store: *mut FfiStore) {
+pub unsafe extern "C" fn free_store(store: *mut Store) {
     drop(unsafe { Box::from_raw(store) });
 }
