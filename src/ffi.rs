@@ -4,8 +4,8 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::{ptr, slice};
 
-use crate::store::Store;
 use crate::BlockHeight;
+use crate::store::Store;
 
 #[repr(C)]
 #[allow(clippy::arbitrary_source_item_ordering)]
@@ -115,10 +115,23 @@ pub unsafe extern "C" fn new_store(args: CreateOrOpenArgs) -> *const Store {
         return ptr::null_mut();
     };
 
-    match Store::new(path, path, cache_size, truncate) {
+    match Store::new(path, path, cache_size, truncate, false, 1) {
         Ok(store) => Box::into_raw(Box::new(store)),
         Err(_) => ptr::null_mut(),
     }
+}
+
+/// Returns the maximum contiguous height of the store.
+///
+/// # Safety
+/// The caller must ensure that `store` is a valid pointer to a `FfiStore` instance.
+///
+/// # Panics
+/// Panics if `store` is a null pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn max_contiguous_height(store: *const Store) -> BlockHeight {
+    let store = unsafe { store.as_ref().unwrap() };
+    store.max_contiguous_height()
 }
 
 /// Frees a store instance.

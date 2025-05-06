@@ -55,6 +55,10 @@ func (s *Store) ReadBlock(id uint64) ([]byte, error) {
 	return C.GoBytes(unsafe.Pointer(cBlock.data), C.int(cBlock.len)), nil
 }
 
+func (s *Store) MaxContiguousHeight() uint64 {
+	return uint64(C.max_contiguous_height(s.handle))
+}
+
 func (s *Store) Close() {
 	C.free_store(s.handle)
 }

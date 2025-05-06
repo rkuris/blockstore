@@ -12,13 +12,13 @@ typedef struct FfiBlock {
   size_t len;
 } FfiBlock;
 
+typedef uint64_t BlockHeight;
+
 typedef struct CreateOrOpenArgs {
   const char *path;
   size_t cache_size;
   bool truncate;
 } CreateOrOpenArgs;
-
-typedef uint64_t BlockHeight;
 
 /**
  * Frees a previous return from `read_block`.
@@ -44,6 +44,17 @@ void free_block(struct FfiBlock block);
  * Panics if the safety lock cannot be acquired.
  */
 void free_store(struct Store *store);
+
+/**
+ * Returns the maximum contiguous height of the store.
+ *
+ * # Safety
+ * The caller must ensure that `store` is a valid pointer to a `FfiStore` instance.
+ *
+ * # Panics
+ * Panics if `store` is a null pointer.
+ */
+BlockHeight max_contiguous_height(const struct Store *store);
 
 /**
  * Creates a new store instance. Returns a pointer to the store, or null if the store cannot be created.

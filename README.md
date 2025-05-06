@@ -13,15 +13,15 @@ Blocks may be received out of order, but we still write the blocks as we receive
 - [x] Ability to stream/iterate over blocks efficiently either forwards or backwards
 - [x] Performs basic sanity checks on blocks (such as a checksum)
 - [x] Support for large and variable-sized blocks
+- [x] A way of fetching the highest known contiguous height on startup
+- [x] Ability to read blocks in parallel
+- [x] Performance tests
 
 ## TODO
 
+- [ ] Complete recovery code for blocks written before flushing the index file
 - [ ] Circular cache for highest height blocks
-- [ ] Guaranteed recovery for blocks that have been written
-- [ ] A way of fetching the highest known contiguous height on startup (todo)
-- [ ] Ability to read blocks in parallel
 - [ ] Iterators
-- [ ] Performance tests
 
 ## Building the Rust Library
 
