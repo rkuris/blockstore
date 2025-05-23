@@ -4,14 +4,15 @@
 //!
 //! The structure of the file contains a single [`IndexFileHeader`] and a sequence of [`IndexEntry`] entries.
 
+use std::fmt::Display;
 use std::fs::{File, OpenOptions};
 use std::io::{Error, ErrorKind, Write as _};
-use std::mem;
 use std::num::NonZeroUsize;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::{fmt, mem};
 
 use bytemuck::{Pod, Zeroable};
 
@@ -47,6 +48,22 @@ macro_rules! record_duration {
     };
 }
 
+#[derive(Clone, Debug, PartialEq)]
+#[repr(u8)]
+pub enum SyncMode {
+    Async = 0,
+    Sync = 1,
+}
+
+impl Display for SyncMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SyncMode::Async => write!(f, "async"),
+            SyncMode::Sync => write!(f, "sync"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Store {
     // TODO: add a recent block cache here
@@ -56,7 +73,7 @@ pub struct Store {
     data_file: File,
     data_highwater: Mutex<u64>,
     header: IndexFileHeader,
-    sync: bool,
+    sync: SyncMode,
     max_contiguous_height: AtomicU64,
     height_highwater: AtomicU64,
 }
@@ -77,20 +94,24 @@ pub struct IndexEntry {
 #[repr(C)]
 pub struct IndexFileHeader {
     // The version of the index file format
-    pub version: u32,
+    pub version: u64,
     // The maximum size of the index file in MB
-    pub max_file_size_mb: u32,
+    // We don't currently use this, but we reserve space for it in the index file
+    // This is used to allow the data file to be split at a given size
+    pub max_file_size: u64,
     // The lowest block height in the index file
     // TODO: this should be a BlockHeight
     pub lowest_block_height: u64,
     // The highest block height in the index file
     pub highest_contiguous_block_height: u64,
+    // The highest block height in the index file
+    pub highest_block_height: u64,
     // The size of the data file in bytes
     pub data_file_size: u64,
 }
 
 impl IndexFileHeader {
-    const INDEX_FILE_VERSION: u32 = 1;
+    const INDEX_FILE_VERSION: u64 = 1;
 
     fn with_lowest_block_height(self, lowest_block_height: u64) -> Self {
         Self {
@@ -104,9 +125,10 @@ impl Default for IndexFileHeader {
     fn default() -> Self {
         Self {
             version: Self::INDEX_FILE_VERSION,
-            max_file_size_mb: 1024,
+            max_file_size: 0,
             lowest_block_height: 1,
             highest_contiguous_block_height: 0,
+            highest_block_height: 0,
             data_file_size: 0,
         }
     }
@@ -118,6 +140,13 @@ struct BlockHeader {
     height: u64,
     size: u64,
     checksum: u64,
+}
+
+impl BlockHeader {
+    /// The maximum size of a block in the store.
+    ///
+    /// This is used to sanity check the block size.
+    const MAX_BLOCK_SIZE: u64 = 1 << 30; // 1GB
 }
 
 impl Store {
@@ -135,7 +164,7 @@ impl Store {
         data_path: &Path,
         _cache_size: NonZeroUsize,
         truncate: bool,
-        sync: bool,
+        sync: SyncMode,
         minimum_height: u64,
     ) -> Result<Self, Error> {
         let mut opts = OpenOptions::new();
@@ -162,7 +191,7 @@ impl Store {
         let mut result = Self {
             index_file,
             data_file,
-            data_highwater: Mutex::new(mem::size_of::<IndexFileHeader>() as u64),
+            data_highwater: Mutex::new(0),
             header,
             sync,
             max_contiguous_height: AtomicU64::new(minimum_height.saturating_sub(1)),
@@ -181,14 +210,6 @@ impl Store {
         // see if the index file contains the correct block file size. This happens
         // if the database was closed cleanly.
         let data_file_actual_size = self.data_file.metadata()?.len();
-        if data_file_actual_size == self.header.data_file_size {
-            return Ok(());
-        }
-        // if the data file is larger than the index file, then we need to read the data and
-        // see if we can apply any of it
-        if data_file_actual_size > self.header.data_file_size {
-            todo!()
-        }
 
         // if the data file is smaller than the index file, then we need to truncate the data file
         if data_file_actual_size < self.header.data_file_size {
@@ -198,7 +219,83 @@ impl Store {
             ));
         }
 
+        self.max_contiguous_height.store(
+            self.header.highest_contiguous_block_height,
+            Ordering::Relaxed,
+        );
+        self.height_highwater
+            .store(self.header.highest_block_height, Ordering::Relaxed);
+
+        // if the data file is larger than the index file, then we need to read the data and
+        // see if we can apply any of it
+        if data_file_actual_size > self.header.data_file_size {
+            // start reading the data file until we reach the end
+            let mut block_header = BlockHeader::default();
+            while self
+                .data_file
+                .read_at(
+                    bytemuck::bytes_of_mut(&mut block_header),
+                    self.header.data_file_size,
+                )
+                .is_ok()
+            {
+                let height = block_header.height;
+                let size = block_header.size;
+                // sanity checks
+                if height < self.header.lowest_block_height {
+                    break;
+                }
+                if size == 0 || size > BlockHeader::MAX_BLOCK_SIZE {
+                    break;
+                }
+                if self.header.data_file_size.saturating_add(size) > data_file_actual_size {
+                    break;
+                }
+
+                // block looks okay, lets read it. We know it's smaller than MAX_BLOCK_SIZE which
+                // will not overflow usize
+
+                self.header.data_file_size = self
+                    .header
+                    .data_file_size
+                    .wrapping_add(mem::size_of::<BlockHeader>() as u64);
+
+                #[allow(clippy::cast_possible_truncation)]
+                let mut block = vec![0; size as usize];
+                self.data_file
+                    .read_at(&mut block, self.header.data_file_size)?;
+
+                // verify the checksum
+                let checksum = fxhash::hash64(&block);
+                if checksum != block_header.checksum {
+                    break;
+                }
+
+                let index_entry = IndexEntry {
+                    offset: self.header.data_file_size,
+                    size,
+                };
+                self.update_index(height, index_entry)?;
+                self.update_highwater(height);
+                self.advance_max_contiguous_height(height);
+
+                self.header.data_file_size = self.header.data_file_size.wrapping_add(size);
+            }
+        }
+
+        *self.data_highwater.lock().unwrap() = self.header.data_file_size;
+
         Ok(())
+    }
+
+    // update the highwater mark if the new height is higher
+    // returns true if the highwater mark was updated
+    fn update_highwater(&self, height: BlockHeight) -> bool {
+        self.height_highwater
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                if old < height { Some(height) } else { None }
+            })
+            .is_ok()
     }
 
     /// Inserts a block into the store.
@@ -208,7 +305,6 @@ impl Store {
     ///
     /// # Panics
     /// Panics if the cache lock has been poisoned.
-    #[allow(clippy::too_many_lines)]
     pub fn write_block(&self, height: BlockHeight, block: &[u8]) -> Result<(), Error> {
         #[cfg(feature = "metrics")]
         let start = coarsetime::Instant::now();
@@ -217,6 +313,11 @@ impl Store {
         if block.is_empty() {
             counter!("blockstore.write_block.empty").increment(1);
             return Err(Error::new(ErrorKind::InvalidInput, "Block is empty"));
+        }
+
+        if block.len() as u64 > BlockHeader::MAX_BLOCK_SIZE {
+            counter!("blockstore.write_block.block_too_large").increment(1);
+            return Err(Error::new(ErrorKind::InvalidInput, "Block too large"));
         }
 
         // check the index file offset for overflows
@@ -278,7 +379,7 @@ impl Store {
                 counter!("blockstore.write_block.write_data_failed").increment(1);
             })?;
 
-        if self.sync {
+        if self.sync == SyncMode::Sync {
             #[cfg(feature = "metrics")]
             let sync_start = coarsetime::Instant::now();
             self.data_file.sync_all()?;
@@ -286,14 +387,38 @@ impl Store {
         }
 
         // update the index file
-        let index_entry = IndexEntry {
-            offset: index_entry_offset,
-            size: block.len() as u64,
-        };
-        self.index_file
-            .write_all_at(bytemuck::bytes_of(&index_entry), index_entry_offset)
-            .inspect_err(|_| counter!("blockstore.write_block.write_index_failed").increment(1))?;
+        self.update_index_at(
+            index_entry_offset,
+            IndexEntry {
+                offset,
+                size: block.len() as u64,
+            },
+        )?;
 
+        self.advance_max_contiguous_height(height);
+
+        if self.update_highwater(height) && height % Self::CHECKPOINT_INTERVAL == 0 {
+            self.checkpoint(saved_offset)?;
+        }
+
+        if self
+            .height_highwater
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                if old < height { Some(height) } else { None }
+            })
+            .is_ok()
+            && height % Self::CHECKPOINT_INTERVAL == 0
+        {
+            self.checkpoint(saved_offset)?;
+        }
+
+        counter!("blockstore.write_block.success").increment(1);
+        record_duration!(start, "blockstore.write_block.success.duration_ms");
+
+        Ok(())
+    }
+
+    fn advance_max_contiguous_height(&self, height: BlockHeight) {
         // optimize for the case where the block height is the next contiguous height
         // if the highest contiguous height is the one block before us, then we update it
         // and start looking for the next gap
@@ -334,22 +459,18 @@ impl Store {
                     }
                 }
             });
+    }
 
-        if self
-            .height_highwater
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                if old < height { Some(height) } else { None }
-            })
-            .is_ok()
-            && height % Self::CHECKPOINT_INTERVAL == 0
-        {
-            self.checkpoint(saved_offset)?;
-        }
-
-        counter!("blockstore.write_block.success").increment(1);
-        record_duration!(start, "blockstore.write_block.success.duration_ms");
-
-        Ok(())
+    fn update_index(&self, height: BlockHeight, index_entry: IndexEntry) -> Result<(), Error> {
+        let offset = self.index_entry_offset(height).ok_or_else(|| {
+            counter!("blockstore.update_index.invalid_block_height").increment(1);
+            Error::new(ErrorKind::InvalidInput, "Invalid block height")
+        })?;
+        self.update_index_at(offset, index_entry)
+    }
+    fn update_index_at(&self, offset: u64, index_entry: IndexEntry) -> Result<(), Error> {
+        self.index_file
+            .write_all_at(bytemuck::bytes_of(&index_entry), offset)
     }
 
     /// Writes the header to the index file.
@@ -363,11 +484,13 @@ impl Store {
     /// # Errors
     /// Returns an error if the header cannot be written.
     fn checkpoint(&self, saved_offset: u64) -> Result<(), Error> {
-        if self.sync {
+        if self.sync == SyncMode::Sync {
             self.index_file.sync_all()?;
         }
         let mut header = self.header;
         header.data_file_size = saved_offset;
+        header.highest_block_height = self.height_highwater.load(Ordering::Relaxed);
+        header.highest_contiguous_block_height = self.max_contiguous_height.load(Ordering::Relaxed);
         self.index_file
             .write_all_at(bytemuck::bytes_of(&header), 0)?;
         Ok(())
@@ -482,7 +605,7 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        if self.sync {
+        if self.sync == SyncMode::Sync {
             self.index_file.sync_all().unwrap();
         }
         // if this fails, no biggie, we'll just have to do recovery at startup
@@ -492,17 +615,23 @@ impl Drop for Store {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::forget;
     use std::thread::{available_parallelism, scope};
 
     use super::*;
 
     #[test]
     fn header_size_test() {
+        // TODO: can this be done at compile time?
         let header_size = mem::size_of::<IndexFileHeader>();
         let entry_size = mem::size_of::<IndexEntry>();
         assert!(
             header_size % entry_size == 0,
             "header size must be a multiple of the entry size"
+        );
+        assert!(
+            mem::align_of::<IndexFileHeader>() == mem::align_of::<IndexEntry>(),
+            "header and entry must have the same alignment"
         );
     }
 
@@ -514,7 +643,7 @@ mod tests {
             tmpdir.path(),
             NonZeroUsize::new(1024).unwrap(),
             true,
-            false,
+            SyncMode::Async,
             1,
         )
         .unwrap();
@@ -535,7 +664,7 @@ mod tests {
             tmpdir.path(),
             NonZeroUsize::new(1024).unwrap(),
             true,
-            false,
+            SyncMode::Async,
             1,
         )
         .unwrap();
@@ -564,5 +693,58 @@ mod tests {
             height.load(Ordering::Relaxed) - 1,
             store.max_contiguous_height()
         );
+    }
+
+    #[test]
+    fn recover_test() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let store = Store::new(
+            tmpdir.path(),
+            tmpdir.path(),
+            NonZeroUsize::new(1024).unwrap(),
+            true,
+            SyncMode::Sync,
+            1,
+        )
+        .unwrap();
+        store.write_block(1, &vec![32; 1024]).unwrap();
+        assert_eq!(1, store.max_contiguous_height());
+
+        // simulate a crash
+        forget(store);
+
+        // recover the store
+        let store = Store::new(
+            tmpdir.path(),
+            tmpdir.path(),
+            NonZeroUsize::new(1024).unwrap(),
+            false,
+            SyncMode::Sync,
+            1,
+        )
+        .unwrap();
+        assert_eq!(1, store.max_contiguous_height());
+        assert_eq!(1, store.height_highwater.load(Ordering::Relaxed));
+
+        // force a checkpoint
+        store
+            .checkpoint(*store.data_highwater.lock().unwrap())
+            .unwrap();
+
+        // simulate a crash
+        forget(store);
+
+        // recover the store
+        let store = Store::new(
+            tmpdir.path(),
+            tmpdir.path(),
+            NonZeroUsize::new(1024).unwrap(),
+            false,
+            SyncMode::Sync,
+            2048, // bogus height, should be ignored
+        )
+        .unwrap();
+        assert_eq!(1, store.max_contiguous_height());
+        assert_eq!(1, store.height_highwater.load(Ordering::Relaxed));
     }
 }

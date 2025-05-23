@@ -4,8 +4,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::{ptr, slice};
 
-use crate::BlockHeight;
-use crate::store::Store;
+use crate::{BlockHeight, Store, SyncMode};
 
 #[repr(C)]
 #[allow(clippy::arbitrary_source_item_ordering)]
@@ -13,6 +12,7 @@ pub struct CreateOrOpenArgs {
     path: *const c_char,
     cache_size: usize,
     truncate: bool,
+    sync: SyncMode,
 }
 
 /// Adds a block to the store.
@@ -115,7 +115,7 @@ pub unsafe extern "C" fn new_store(args: CreateOrOpenArgs) -> *const Store {
         return ptr::null_mut();
     };
 
-    match Store::new(path, path, cache_size, truncate, false, 1) {
+    match Store::new(path, path, cache_size, truncate, args.sync, 1) {
         Ok(store) => Box::into_raw(Box::new(store)),
         Err(_) => ptr::null_mut(),
     }

@@ -9,29 +9,32 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSmoke(t *testing.T) {
 	dir, err := os.MkdirTemp("", "blockstore_test")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	store := NewStore(dir)
+	store, err := NewRustStore(dir, Async)
+	require.NoError(t, err)
 
 	// Generate some random data, used for all blocks, size 1k
 	data := make([]byte, 1024)
 	_, err = rand.Read(data)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// write this block
-	assert.Equal(t, nil, store.WriteBlock(Block{
+	err = store.WriteBlock(Block{
 		Height: 1,
 		Data:   data,
-	}))
+	})
+	require.NoError(t, err)
 
 	// read it back, and make sure it's the same
 	block, err := store.ReadBlock(1)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, data, block)
 
 	// check the maximum contiguous height
@@ -40,13 +43,14 @@ func TestSmoke(t *testing.T) {
 
 func TestParallel(t *testing.T) {
 	dir, err := os.MkdirTemp("", "blockstore_test")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	store := NewStore(dir)
+	store, err := NewRustStore(dir, Async)
+	require.NoError(t, err)
 	data := make([]byte, 1024)
 	_, err = rand.Read(data)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	wg := sync.WaitGroup{}
 	numGoroutines := runtime.NumCPU()
@@ -56,10 +60,71 @@ func TestParallel(t *testing.T) {
 		go func() {
 			for j := 0; j < 1024; j++ {
 				h := height.Add(1)
-				store.WriteBlock(Block{Height: h, Data: data})
+				err := store.WriteBlock(Block{Height: h, Data: data})
+				require.NoError(t, err)
 			}
 			wg.Done()
 		}()
 	}
 	wg.Wait()
+}
+
+func BenchmarkReadBlock(b *testing.B) {
+	dir, err := os.MkdirTemp("", "blockstore_test")
+	require.NoError(b, err)
+	defer os.RemoveAll(dir)
+
+	store, err := NewRustStore(dir, Async)
+	require.NoError(b, err)
+	data := make([]byte, 1024)
+	for i := range data {
+		data[i] = 32
+	}
+
+	var height atomic.Uint64
+	err = store.WriteBlock(Block{Height: height.Add(1), Data: data})
+	require.NoError(b, err)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		store.ReadBlock(1)
+	}
+}
+
+func BenchmarkWriteBlock(b *testing.B) {
+	b.Run("async", func(b *testing.B) {
+		benchWrite(b, Async)
+	})
+	b.Run("sync", func(b *testing.B) {
+		benchWrite(b, Sync)
+	})
+}
+
+func benchWrite(b *testing.B, syncMode SyncMode) {
+	dir, err := os.MkdirTemp("", "blockstore_test")
+	require.NoError(b, err)
+	defer os.RemoveAll(dir)
+
+	store, err := NewRustStore(dir, syncMode)
+	require.NoError(b, err)
+	data := make([]byte, 1024)
+	for i := range data {
+		data[i] = 32
+	}
+
+	var height atomic.Uint64
+	nthreads := runtime.NumCPU()
+	b.ResetTimer()
+	for i := 0; i < b.N/nthreads; i++ {
+		wg := sync.WaitGroup{}
+		wg.Add(nthreads)
+		for j := 0; j < nthreads; j++ {
+			go func() {
+				defer wg.Done()
+				err := store.WriteBlock(Block{Height: height.Add(1), Data: data})
+				require.NoError(b, err)
+			}()
+		}
+		wg.Wait()
+	}
 }

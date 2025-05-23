@@ -10,26 +10,21 @@ import (
 // #include <stdlib.h>
 // #include "blockstore.h"
 import "C"
-
-type Block struct {
-	Height uint64
-	Data   []byte
-}
-
 type Store struct {
 	handle *C.struct_Store
 }
 
-func NewStore(path string) *Store {
+func NewRustStore(path string, sync SyncMode) (*Store, error) {
 	createOrOpenArgs := C.struct_CreateOrOpenArgs{
 		path:       C.CString(path),
 		cache_size: C.size_t(64 * 1024 * 1024), // 64MB cache
 		truncate:   C._Bool(true),
+		sync:       C.SyncMode(sync),
 	}
 
 	return &Store{
 		handle: C.new_store(createOrOpenArgs),
-	}
+	}, nil
 }
 
 func (s *Store) WriteBlock(block Block) error {

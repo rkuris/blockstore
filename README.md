@@ -16,12 +16,13 @@ Blocks may be received out of order, but we still write the blocks as we receive
 - [x] A way of fetching the highest known contiguous height on startup
 - [x] Ability to read blocks in parallel
 - [x] Performance tests
+- [x] Recovery code for blocks written before flushing the index file
 
 ## TODO
 
-- [ ] Complete recovery code for blocks written before flushing the index file
 - [ ] Circular cache for highest height blocks
 - [ ] Iterators
+- [ ] Configuration option to promise in-order writes, maybe after a specific height
 
 ## Building the Rust Library
 

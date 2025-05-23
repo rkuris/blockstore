@@ -5,6 +5,12 @@
 #include <stdlib.h>
 
 
+enum SyncMode {
+  Async = 0,
+  Sync = 1,
+};
+typedef uint8_t SyncMode;
+
 typedef struct Store Store;
 
 typedef struct FfiBlock {
@@ -18,6 +24,7 @@ typedef struct CreateOrOpenArgs {
   const char *path;
   size_t cache_size;
   bool truncate;
+  SyncMode sync;
 } CreateOrOpenArgs;
 
 /**
