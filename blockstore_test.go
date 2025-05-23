@@ -20,25 +20,28 @@ func TestSmoke(t *testing.T) {
 	store, err := NewRustStore(dir, Async)
 	require.NoError(t, err)
 
-	// Generate some random data, used for all blocks, size 1k
-	data := make([]byte, 1024)
-	_, err = rand.Read(data)
-	require.NoError(t, err)
+	blockCount := 2
+	writtenBlocks := make(map[uint64][]byte, blockCount)
+	for i := 1; i <= blockCount; i++ {
+		data := make([]byte, 1024)
+		_, err = rand.Read(data)
+		assert.NoError(t, err)
+		err = store.WriteBlock(Block{
+			Height: uint64(i),
+			Data:   data,
+		})
+		require.NoError(t, err)
+		writtenBlocks[uint64(i)] = data
 
-	// write this block
-	err = store.WriteBlock(Block{
-		Height: 1,
-		Data:   data,
-	})
-	require.NoError(t, err)
+		// check the maximum contiguous height
+		assert.Equal(t, uint64(i), store.MaxContiguousHeight())
+	}
 
-	// read it back, and make sure it's the same
-	block, err := store.ReadBlock(1)
-	require.NoError(t, err)
-	assert.Equal(t, data, block)
-
-	// check the maximum contiguous height
-	assert.Equal(t, uint64(1), store.MaxContiguousHeight())
+	for i := 1; i <= blockCount; i++ {
+		block, err := store.ReadBlock(uint64(i))
+		assert.NoError(t, err)
+		assert.Equal(t, writtenBlocks[uint64(i)], block)
+	}
 }
 
 func TestParallel(t *testing.T) {
