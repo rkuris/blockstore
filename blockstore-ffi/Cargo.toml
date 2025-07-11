@@ -1,0 +1,24 @@
+[package]
+name = "blockstore-ffi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+readme.workspace = true
+repository = "https://github.com/rkuris/blockstore"
+description = "FFI bindings for the blockstore library"
+keywords = ["blockchain", "blockstore", "blockchain-storage"]
+categories = ["database-implementations"]
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+blockstore = { path = "../blockstore" }
+bytemuck.workspace = true
+
+[build-dependencies]
+cbindgen.workspace = true 
+
+[lints]
+workspace = true

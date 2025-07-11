@@ -125,9 +125,9 @@ bitflags = false
 ############## Options for How Your Rust library Should Be Parsed ##############
 
 [parse]
-parse_deps = false
-# include = []
-exclude = []
+parse_deps = true
+include = [ "blockstore" ]
+# exclude = []
 clean = false
 extra_bindings = []
 

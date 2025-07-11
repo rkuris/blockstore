@@ -5,11 +5,10 @@
 #include <stdlib.h>
 
 
-enum SyncMode {
+typedef enum SyncMode {
   Async = 0,
   Sync = 1,
-};
-typedef uint8_t SyncMode;
+} SyncMode;
 
 typedef struct Store Store;
 
@@ -24,11 +23,11 @@ typedef struct CreateOrOpenArgs {
   const char *path;
   size_t cache_size;
   bool truncate;
-  SyncMode sync;
+  enum SyncMode sync;
 } CreateOrOpenArgs;
 
 /**
- * Frees a previous return from `read_block`.
+ * Frees a previous return from `read_block` or `read_block_header`
  *
  * # Safety
  * The caller must ensure that `data` is a valid pointer to a block.
@@ -89,6 +88,8 @@ const struct Store *new_store(struct CreateOrOpenArgs args);
  */
 struct FfiBlock read_block(const struct Store *store, BlockHeight id);
 
+struct FfiBlock read_block_header(const struct Store *store, BlockHeight id);
+
 /**
  * Adds a block to the store.
  *
@@ -107,4 +108,5 @@ struct FfiBlock read_block(const struct Store *store, BlockHeight id);
 const char *write_block(const struct Store *store,
                         BlockHeight height,
                         size_t block_len,
-                        const uint8_t *block_data);
+                        const uint8_t *block_data,
+                        uint16_t header_size);

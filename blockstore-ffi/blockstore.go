@@ -6,9 +6,9 @@ import (
 	"unsafe"
 )
 
-// #cgo LDFLAGS: -L${SRCDIR}/target/release -lblockstore_ffi
+// #cgo LDFLAGS: -L${SRCDIR}/../target/release -lblockstore_ffi
 // #include <stdlib.h>
-// #include "blockstore.h"
+// #include "src/blockstore.h"
 import "C"
 type Store struct {
 	handle *C.struct_Store
@@ -19,7 +19,7 @@ func NewRustStore(path string, sync SyncMode) (*Store, error) {
 		path:       C.CString(path),
 		cache_size: C.size_t(64 * 1024 * 1024), // 64MB cache
 		truncate:   C._Bool(true),
-		sync:       C.SyncMode(sync),
+		sync:       uint32(sync),
 	}
 
 	return &Store{
@@ -27,12 +27,12 @@ func NewRustStore(path string, sync SyncMode) (*Store, error) {
 	}, nil
 }
 
-func (s *Store) WriteBlock(block Block) error {
+func (s *Store) WriteBlock(block Block, header_size uint16) error {
 	pinner := runtime.Pinner{}
 	pinner.Pin(&block.Data[0])
 	defer pinner.Unpin()
 
-	result := C.write_block(s.handle, C.uint64_t(block.Height), C.size_t(len(block.Data)), (*C.uchar)(unsafe.SliceData(block.Data)))
+	result := C.write_block(s.handle, C.uint64_t(block.Height), C.size_t(len(block.Data)), (*C.uchar)(unsafe.SliceData(block.Data)), C.uint16_t(header_size))
 	if result != nil {
 		return errors.New(C.GoString(result))
 	}
@@ -41,6 +41,17 @@ func (s *Store) WriteBlock(block Block) error {
 
 func (s *Store) ReadBlock(id uint64) ([]byte, error) {
 	cBlock := C.read_block(s.handle, C.uint64_t(id))
+	if cBlock.len == 0 {
+		if cBlock.data == nil {
+			return nil, nil
+		}
+		return nil, errors.New(C.GoString((*C.char)(unsafe.Pointer(cBlock.data))))
+	}
+	return C.GoBytes(unsafe.Pointer(cBlock.data), C.int(cBlock.len)), nil
+}
+
+func (s *Store) ReadBlockHeader(id uint64) ([]byte, error) {
+	cBlock := C.read_block_header(s.handle, C.uint64_t(id))
 	if cBlock.len == 0 {
 		if cBlock.data == nil {
 			return nil, nil

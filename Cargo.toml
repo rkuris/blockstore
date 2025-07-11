@@ -1,34 +1,29 @@
-[package]
-name = "blockstore_ffi"
+[workspace]
+members = [
+    "blockstore",
+    "blockstore-ffi",
+    "blockstore-cli",
+    "parser",
+]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "A simple blockchain block store in Rust"
 authors = ["Ron Kuris <swcafe@gmail.com>"]
-keywords = ["blockchain", "blockstore", "blockchain-storage"]
-categories = ["database-implementations"]
-repository = "https://github.com/rkuris/blockstore"
 license-file = "LICENSE.md"
 readme = "README.md"
 
-[lib]
-crate-type=["staticlib", "rlib"]
-
-[dependencies]
+[workspace.dependencies]
 bytemuck = { version = "1.13.1", features = ["derive"] }
-fxhash = "0.2.1"
-metrics = { version = "0.24.1", optional = true }
-coarsetime = { version = "0.1.36", optional = true }
-
-[dev-dependencies]
-tempfile = "3.19.1"
+xxhash-rust = { version = "0.8.10", features = ["xxh64"] }
+tempfile = "3.20.0"
 more-asserts = "0.3.1"
 criterion = { version = "0.5.1", features = ["html_reports"] }
-pprof = { version = "0.14.0", features = ["flamegraph", "criterion"] }
+pprof = { version = "0.15.0", features = ["flamegraph", "criterion"] }
+cbindgen = "0.29.0"
 
-[build-dependencies]
-cbindgen = "0.28.0"
-
-[lints.clippy]
+[workspace.lints.clippy]
 pedantic = "warn"
 all = "warn"
 cargo = "warn"
@@ -40,12 +35,8 @@ exit = "warn"
 dbg-macro = "warn"
 decimal-literal-representation = "warn"
 
-[[bench]]
-name = "bench"
-harness = false
-
 [profile.bench]
 debug = true
 
-[features]
-metrics = ["dep:metrics", "dep:coarsetime"]
+[patch.crates-io]
+leveldb-sys = { git = "https://github.com/rkuris/leveldb-sys.git", branch = "master" }

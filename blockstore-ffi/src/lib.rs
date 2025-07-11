@@ -1,10 +1,12 @@
+#![allow(clippy::cargo_common_metadata)]
+
 use std::ffi::{CStr, CString, OsStr, c_char};
 use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::{ptr, slice};
 
-use crate::{BlockHeight, Store, SyncMode};
+use blockstore::{BlockHeight, Store, SyncMode};
 
 #[repr(C)]
 #[allow(clippy::arbitrary_source_item_ordering)]
@@ -34,10 +36,11 @@ pub unsafe extern "C" fn write_block(
     height: BlockHeight,
     block_len: usize,
     block_data: *const u8,
+    header_size: u16,
 ) -> *const c_char {
     let store = unsafe { store.as_ref().unwrap() };
     let block = unsafe { slice::from_raw_parts(block_data, block_len) };
-    match store.write_block(height, block) {
+    match store.write_block(height, block, header_size) {
         Ok(()) => ptr::null(),
         // TODO: error strings leak memory :()
         Err(e) => CString::new(e.to_string()).unwrap().into_raw(),
@@ -56,8 +59,14 @@ pub struct FfiBlock {
 /// zero length and null pointer. If an error occurs, it returns
 /// a C string containing the error message and a zero size.
 ///
+/// # Errors
+/// Returns an error if:
+/// - The file cannot be read
+/// - The block header cannot be decoded
+/// - The block data cannot be read
+///
 /// # Safety
-/// The caller must ensure that `store` is a valid pointer to a `FfiStore` instance.
+/// The caller must ensure that `store` is a valid pointer to a `Store` instance.
 ///
 /// # Panics
 /// Panics if `store` is a null pointer.
@@ -83,7 +92,46 @@ pub unsafe extern "C" fn read_block(store: *const Store, id: BlockHeight) -> Ffi
     }
 }
 
-/// Frees a previous return from `read_block`.
+/// Retrieves a block header by its ID.
+///
+/// If the block cannot be found, it returns a block with a
+/// zero length and null pointer. If an error occurs, it returns
+/// a C string containing the error message and a zero size.
+///
+/// # Errors
+/// Returns an error if:
+/// - The file cannot be read
+/// - The block header cannot be decoded
+/// - The block data cannot be read
+///
+/// # Safety
+/// The caller must ensure that `store` is a valid pointer to a `Store` instance.
+///
+/// # Panics
+/// Panics if `store` is a null pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn read_block_header(store: *const Store, id: BlockHeight) -> FfiBlock {
+    let store = unsafe { store.as_ref().unwrap() };
+    match store.read_block_header(id) {
+        Ok(Some(block)) => {
+            let leaked = Box::leak(block);
+            FfiBlock {
+                data: leaked.as_mut_ptr(),
+                len: leaked.len(),
+            }
+        }
+        Ok(None) => FfiBlock {
+            data: ptr::null_mut(),
+            len: 0,
+        },
+        Err(e) => FfiBlock {
+            data: CString::new(e.to_string()).unwrap().into_raw().cast::<u8>(),
+            len: 0,
+        },
+    }
+}
+
+/// Frees a previous return from `read_block` or `read_block_header`
 ///
 /// # Safety
 /// The caller must ensure that `data` is a valid pointer to a block.

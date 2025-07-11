@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt, mem};
 
 use bytemuck::{Pod, Zeroable};
+use xxhash_rust::xxh64::xxh64;
 
 use crate::{Block, BlockHeight};
 
@@ -49,7 +50,7 @@ macro_rules! record_duration {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[repr(u8)]
+#[repr(C)]
 pub enum SyncMode {
     Async = 0,
     Sync = 1,
@@ -83,7 +84,8 @@ pub struct Store {
 #[repr(C)]
 pub struct IndexEntry {
     pub offset: u64,
-    pub size: u64,
+    pub size: u32,
+    pub header_size: u32,
 }
 
 /// The header of the index file.
@@ -138,15 +140,73 @@ impl Default for IndexFileHeader {
 #[repr(C)]
 struct BlockHeader {
     height: u64,
-    size: u64,
     checksum: u64,
+    size: u32,
+    header_size: u32,
 }
 
 impl BlockHeader {
     /// The maximum size of a block in the store.
     ///
     /// This is used to sanity check the block size.
-    const MAX_BLOCK_SIZE: u64 = 1 << 30; // 1GB
+    const MAX_BLOCK_SIZE: u32 = 1 << 30; // 1GB
+}
+
+/// Compresses the given data using Snappy compression.
+///
+/// # Arguments
+/// * `data` - The data to compress
+///
+/// # Returns
+/// A `Vec<u8>` containing the compressed data
+///
+/// # Panics
+/// Panics if compression fails
+fn compress(data: &[u8]) -> Vec<u8> {
+    #[cfg(all(feature = "snappy", not(feature = "zstd")))]
+    {
+        let mut encoder = snap::write::FrameEncoder::new(Vec::new());
+        encoder.write_all(data).expect("Failed to write to encoder");
+        encoder
+            .into_inner()
+            .expect("Failed to finalize compression")
+    }
+    #[cfg(feature = "zstd")]
+    {
+        const ZSTD_COMPRESSION_LEVEL: i32 = 3;
+        zstd::encode_all(data, ZSTD_COMPRESSION_LEVEL).expect("all in memory")
+    }
+
+    #[cfg(not(any(feature = "zstd", feature = "snappy")))]
+    data.into()
+}
+
+/// Decompresses the given data using Snappy decompression.
+///
+/// # Arguments
+/// * `compressed_data` - The compressed data to decompress
+///
+/// # Returns
+/// A `Vec<u8>` containing the decompressed data
+///
+/// # Panics
+/// Panics if decompression fails
+fn decompress(compressed_data: &[u8]) -> Vec<u8> {
+    #[cfg(all(feature = "snappy", not(feature = "zstd")))]
+    {
+        let mut decoder = snap::read::FrameDecoder::new(compressed_data);
+        let mut decompressed = Vec::new();
+        decoder
+            .read_to_end(&mut decompressed)
+            .expect("Failed to decompress data");
+        decompressed
+    }
+    #[cfg(feature = "zstd")]
+    {
+        zstd::decode_all(compressed_data).expect("all in memory")
+    }
+    #[cfg(not(any(feature = "zstd", feature = "snappy")))]
+    compressed_data.into()
 }
 
 impl Store {
@@ -248,7 +308,7 @@ impl Store {
                 if size == 0 || size > BlockHeader::MAX_BLOCK_SIZE {
                     break;
                 }
-                if self.header.data_file_size.saturating_add(size) > data_file_actual_size {
+                if self.header.data_file_size.saturating_add(size.into()) > data_file_actual_size {
                     break;
                 }
 
@@ -261,12 +321,15 @@ impl Store {
                     .wrapping_add(mem::size_of::<BlockHeader>() as u64);
 
                 #[allow(clippy::cast_possible_truncation)]
-                let mut block = vec![0; size as usize];
+                let mut compressed_block = vec![0; size as usize];
                 self.data_file
-                    .read_at(&mut block, self.header.data_file_size)?;
+                    .read_at(&mut compressed_block, self.header.data_file_size)?;
 
-                // verify the checksum
-                let checksum = fxhash::hash64(&block);
+                // decompress the block data
+                let block = decompress(&compressed_block);
+
+                // verify the checksum (checksum is calculated on the original uncompressed data)
+                let checksum = xxh64(&block, 0);
                 if checksum != block_header.checksum {
                     break;
                 }
@@ -274,12 +337,13 @@ impl Store {
                 let index_entry = IndexEntry {
                     offset: self.header.data_file_size,
                     size,
+                    header_size: 0,
                 };
                 self.update_index(height, index_entry)?;
                 self.update_highwater(height);
                 self.advance_max_contiguous_height(height);
 
-                self.header.data_file_size = self.header.data_file_size.wrapping_add(size);
+                self.header.data_file_size = self.header.data_file_size.wrapping_add(size.into());
             }
         }
 
@@ -305,7 +369,12 @@ impl Store {
     ///
     /// # Panics
     /// Panics if the cache lock has been poisoned.
-    pub fn write_block(&self, height: BlockHeight, block: &[u8]) -> Result<(), Error> {
+    pub fn write_block(
+        &self,
+        height: BlockHeight,
+        block: &[u8],
+        header_size: u16,
+    ) -> Result<(), Error> {
         #[cfg(feature = "metrics")]
         let start = coarsetime::Instant::now();
 
@@ -315,10 +384,19 @@ impl Store {
             return Err(Error::new(ErrorKind::InvalidInput, "Block is empty"));
         }
 
-        if block.len() as u64 > BlockHeader::MAX_BLOCK_SIZE {
+        let block_len: u32 = block
+            .len()
+            .try_into()
+            .unwrap_or(BlockHeader::MAX_BLOCK_SIZE);
+
+        if block_len == BlockHeader::MAX_BLOCK_SIZE {
             counter!("blockstore.write_block.block_too_large").increment(1);
             return Err(Error::new(ErrorKind::InvalidInput, "Block too large"));
         }
+
+        // compress the block
+        let compressed_block = compress(block);
+        let compressed_block_len: u32 = compressed_block.len().try_into().unwrap();
 
         // check the index file offset for overflows
         // this limits our block height to 2^64 / size_of::<IndexEntry>(), or 2^60 blocks
@@ -327,22 +405,23 @@ impl Store {
             Error::new(ErrorKind::InvalidInput, "Invalid block height")
         })?;
 
-        // calculate the size of the block with the header. An overflow here only happens if the block is
+        // calculate the size of the compressed block with the header. An overflow here only happens if the block is
         // just under MAX_U64, which is a mighty big buffer to be passing to this function...
-        let size_with_header = block
+        let size_with_header = compressed_block
             .len()
             .checked_add(mem::size_of::<BlockHeader>())
             .expect("blocks will never be so large as to overflow u64")
             as u64;
 
-        // calculate the hash of the block
-        let checksum = fxhash::hash64(&block);
+        // calculate the hash of the original (uncompressed) block
+        let checksum = xxh64(block, 0);
 
         // construct the block header
         let header = BlockHeader {
             height,
-            size: block.len() as u64,
+            size: compressed_block_len,
             checksum,
+            header_size: header_size.into(),
         };
 
         // barring running out of space or an IO error, we can now be sure the block can be written,
@@ -366,13 +445,13 @@ impl Store {
                 counter!("blockstore.write_block.write_header_failed").increment(1);
             })?;
 
-        // write the block data
+        // write the compressed block data
         // safe to use wrapping_add here because we checked for overflow above
         // TODO: use a single write_all_at call to write both the header and the data
         // saves a syscall but requires copying the data around in memory
         self.data_file
             .write_all_at(
-                block,
+                &compressed_block,
                 offset.wrapping_add(mem::size_of::<BlockHeader>() as u64),
             )
             .inspect_err(|_| {
@@ -391,7 +470,8 @@ impl Store {
             index_entry_offset,
             IndexEntry {
                 offset,
-                size: block.len() as u64,
+                size: compressed_block_len,
+                header_size: header_size.into(),
             },
         )?;
 
@@ -536,70 +616,117 @@ impl Store {
         #[cfg(feature = "metrics")]
         let start = coarsetime::Instant::now();
 
-        let index_entry = self.read_index_entry(height).inspect_err(|_| {
+        let entry = self.read_index_entry(height).inspect_err(|_| {
             counter!("blockstore.read_block.read_index_entry_failed").increment(1);
         })?;
-        if let Some(index_entry) = index_entry {
-            let block_size = index_entry.size;
-            if block_size == 0 {
-                counter!("blockstore.read_block.not_found").increment(1);
-                return Ok(None);
-            }
-            // TODO: we know the size and can read the whole header and data in one read...
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
 
-            // read the block header
-            let mut blockheader = BlockHeader::default();
-            self.data_file
-                .read_at(bytemuck::bytes_of_mut(&mut blockheader), index_entry.offset)
-                .inspect_err(|_| {
-                    counter!("blockstore.read_block.read_header_failed").increment(1);
-                })?;
-
-            if blockheader.size != block_size {
-                counter!("blockstore.read_block.block_size_mismatch").increment(1);
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "block size in index file does not match data",
-                ));
-            }
-
-            // read the block data
-            // this conversion is infallable on 64 bit systems, but not on 32 bit systems
-            let block_size: usize = block_size
-                .try_into()
-                .inspect_err(|_| {
-                    counter!("blockstore.read_block.block_size_too_large").increment(1);
-                })
-                .map_err(|_| Error::new(ErrorKind::InvalidData, "block size too large"))?;
-
-            let mut block = vec![0; block_size];
-            // checked_add should be infallable (overflowing here means that the block offset is almost at 2^64, which is insane)
-            self.data_file.read_at(
-                &mut block,
-                index_entry
-                    .offset
-                    .checked_add(mem::size_of::<BlockHeader>() as u64)
-                    .expect("block offset overflow"),
-            )?;
-
-            // verify the checksum
-            let checksum = fxhash::hash64(&block);
-            if checksum != blockheader.checksum {
-                counter!("blockstore.read_block.checksum_mismatch").increment(1);
-                return Err(Error::new(ErrorKind::InvalidData, "checksum mismatch"));
-            }
-
-            let block = Some(block.into());
-            counter!("blockstore.read_block.success").increment(1);
-            record_duration!(start, "blockstore.read_block.success.duration_ms");
-            return Ok(block);
+        let block_size = entry.size;
+        if block_size == 0 {
+            counter!("blockstore.read_block.not_found").increment(1);
+            return Ok(None);
         }
-        counter!("blockstore.read_block.not_found").increment(1);
-        Ok(None)
+        // TODO: we know the size and can read the whole header and data in one read...
+
+        // read the block header
+        let mut blockheader = BlockHeader::default();
+        self.data_file
+            .read_at(bytemuck::bytes_of_mut(&mut blockheader), entry.offset)
+            .inspect_err(|_| {
+                counter!("blockstore.read_block.read_header_failed").increment(1);
+            })?;
+
+        if blockheader.size != block_size {
+            counter!("blockstore.read_block.block_size_mismatch").increment(1);
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "block size in index file does not match data",
+            ));
+        }
+
+        // read the compressed block data
+        // this conversion is infallable on 64 bit systems, but not on 32 bit systems
+        let block_size: usize = block_size
+            .try_into()
+            .inspect_err(|_| {
+                counter!("blockstore.read_block.block_size_too_large").increment(1);
+            })
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "block size too large"))?;
+
+        let mut compressed_block = vec![0; block_size];
+        // checked_add should be infallable (overflowing here means that the block offset is almost at 2^64, which is insane)
+        self.data_file.read_at(
+            &mut compressed_block,
+            entry
+                .offset
+                .checked_add(mem::size_of::<BlockHeader>() as u64)
+                .expect("block offset overflow"),
+        )?;
+
+        // decompress the block data
+        let block = decompress(&compressed_block);
+
+        // verify the checksum (checksum is calculated on the original uncompressed data)
+        let checksum = xxh64(&block, 0);
+        if checksum != blockheader.checksum {
+            counter!("blockstore.read_block.checksum_mismatch").increment(1);
+            return Err(Error::new(ErrorKind::InvalidData, "checksum mismatch"));
+        }
+
+        let block = Some(block.into());
+        counter!("blockstore.read_block.success").increment(1);
+        record_duration!(start, "blockstore.read_block.success.duration_ms");
+        Ok(block)
     }
 
     pub fn max_contiguous_height(&self) -> BlockHeight {
         self.max_contiguous_height.load(Ordering::Relaxed)
+    }
+
+    pub fn min_block_height(&self) -> BlockHeight {
+        self.header.lowest_block_height
+    }
+
+    /// Reads the header portion of a block at the specified height.
+    /// The size of the header was specified when the block was written.
+    ///
+    /// # Arguments
+    ///
+    /// * `height` - The height of the block to read
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(Block))` - The block header if found
+    /// * `Ok(None)` - If no block exists at the specified height
+    /// * `Err(Error)` - If there was an error reading the block
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - The file cannot be read
+    /// - The block header cannot be decoded
+    /// - The block data cannot be read
+    pub fn read_block_header(&self, height: BlockHeight) -> Result<Option<Block>, Error> {
+        let index = self.index_entry_offset(height).ok_or_else(|| {
+            counter!("blockstore.read_block_header.invalid_block_height").increment(1);
+            Error::new(ErrorKind::InvalidInput, "Invalid block height")
+        })?;
+
+        let entry = self.read_index_entry(height)?;
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+
+        let mut data = vec![0u8; entry.header_size as usize];
+        let offset = index
+            .checked_add(mem::size_of::<IndexFileHeader>() as u64)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Overflow in offset calculation"))?
+            .checked_add(mem::size_of::<IndexEntry>() as u64)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Overflow in offset calculation"))?;
+        self.data_file.read_at(&mut data, offset)?;
+
+        Ok(Some(data.into()))
     }
 }
 
@@ -648,7 +775,7 @@ mod tests {
         )
         .unwrap();
         let block = vec![32; 1024];
-        store.write_block(1, &block).unwrap();
+        store.write_block(1, &block, 0).unwrap();
         let block_read = store.read_block(1).unwrap().unwrap();
         assert_eq!(block.into_boxed_slice(), block_read);
 
@@ -679,7 +806,7 @@ mod tests {
                     s.spawn(|| {
                         for _ in 0..100 {
                             let i = height.fetch_add(1, Ordering::Relaxed);
-                            store.write_block(i, &data).unwrap();
+                            store.write_block(i, &data, 0).unwrap();
                         }
                     })
                 })
@@ -707,7 +834,7 @@ mod tests {
             1,
         )
         .unwrap();
-        store.write_block(1, &vec![32; 1024]).unwrap();
+        store.write_block(1, &vec![32; 1024], 0).unwrap();
         assert_eq!(1, store.max_contiguous_height());
 
         // simulate a crash

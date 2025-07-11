@@ -1,0 +1,17 @@
+[package]
+name = "parser"
+description = "Parser for Ethereum blocks"
+repository = "https://github.com/ava-labs/blockstore/parser"
+categories = ["blockchain"]
+keywords = ["blockchain", "ethereum", "parser"]
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+readme.workspace = true
+
+[dependencies]
+rlp = { version = "0.6.1", features = ["derive"] }
+
+[lints]
+workspace = true
