@@ -61,15 +61,24 @@ impl CachedStore {
     /// Forwards errors from [`Store::read_block`].
     pub fn read_block(&self, height: BlockHeight) -> Result<Option<Block>, Error> {
         if let Some(cached) = self.cache.lock().get(&height) {
+            counter!("blockstore.cache.read", "result" => "hit").increment(1);
             return Ok(Some(Arc::clone(&cached.0)));
         }
+        counter!("blockstore.cache.read", "result" => "miss").increment(1);
         let block = self.inner.read_block(height)?;
         if let Some(ref b) = block {
             // `insert` can fail if a single entry exceeds the cache's
             // byte budget; in that case we just skip caching and the
             // next read will miss again. Not an error from the caller's
             // perspective.
-            let _ = self.cache.lock().insert(height, CacheEntry(Arc::clone(b)));
+            match self.cache.lock().insert(height, CacheEntry(Arc::clone(b))) {
+                Ok(_) => {
+                    counter!("blockstore.cache.populate", "outcome" => "ok").increment(1);
+                }
+                Err(_) => {
+                    counter!("blockstore.cache.populate", "outcome" => "oversize").increment(1);
+                }
+            }
         }
         Ok(block)
     }
@@ -82,7 +91,15 @@ impl CachedStore {
     pub fn write_block(&self, height: BlockHeight, data: &[u8]) -> Result<(), Error> {
         self.inner.write_block(height, data)?;
         let block: Block = data.into();
-        let _ = self.cache.lock().insert(height, CacheEntry(block));
+        match self.cache.lock().insert(height, CacheEntry(block)) {
+            Ok(_) => {
+                counter!("blockstore.cache.populate_on_write", "outcome" => "ok").increment(1);
+            }
+            Err(_) => {
+                counter!("blockstore.cache.populate_on_write", "outcome" => "oversize")
+                    .increment(1);
+            }
+        }
         Ok(())
     }
 

@@ -16,6 +16,85 @@ Each entry: what blockdb does → what we do → why it's better.
 
 ## Additional features
 
+### Byte-budgeted block cache
+
+**blockdb:** `cacheDB` is sized by *number of cached entries* —
+`BlockCacheSize uint16` defaults to 256 (`config.go:14-15`). The cache
+holds up to 256 `BlockData` entries regardless of their size. Total
+memory usage is `256 × whatever_block_sizes_happen_to_be`, which on
+Avalanche can mean anywhere from a few hundred KiB (small P-chain
+blocks) to multiple GiB (large C-chain blocks). No memory-pressure
+guarantee.
+
+**Rust:** `CachedStore` uses [`lru-mem`](https://crates.io/crates/lru-mem),
+which evicts oldest entries until the total tracked heap occupancy
+stays under a *byte budget* (`StoreOptions::cache_size: NonZeroUsize`,
+in bytes). Block sizes vary; the byte budget gives a hard
+memory-pressure bound regardless of which blocks are hot.
+
+**Why it's useful:** Operators can size the cache by "how much RAM I'm
+willing to spend on block caching" — a number they can actually reason
+about — instead of "how many entries, given block sizes I have to
+guess". For Avalanche specifically, where C-chain block sizes can be
+1000× larger than P-chain blocks, this is the difference between a
+predictable memory footprint and a per-workload surprise.
+
+**Implementation note:** `Block` is `Arc<[u8]>` rather than `Box<[u8]>`
+so cache hits are O(1) reference-count clones, not memcpy. A small
+newtype `CacheEntry` lets `Arc<[u8]>` participate in lru-mem's
+`HeapSize`-aware accounting; the cache over-counts when callers hold
+outstanding `Arc` clones, but always stays *under* its budget
+(conservative eviction, never an overflow).
+
+### Metrics surface
+
+**blockdb:** ships no internal counters or gauges. The cache, the
+recovery scan, and the read/write paths emit zap log lines for
+notable events but no machine-readable telemetry. Operators wanting
+to know "is the cache doing work?" or "how many block reads are
+hitting the slow path?" must instrument the consumer side.
+
+**Rust:** every read/write path and every cache lookup emits a
+`metrics` counter, gated behind `feature = "metrics"` (no-op when
+off, so there's no runtime cost in builds that don't want them). The
+pattern mirrors firewood's: a single counter name with structured
+labels distinguishing the variants.
+
+Current counters (under the `blockstore.` prefix):
+
+| Counter | Labels | Where |
+|---|---|---|
+| `read_block.success` | — | per successful read |
+| `read_block.not_found` | — | block doesn't exist |
+| `read_block.checksum_mismatch` | — | corrupt block detected on read |
+| `read_block.read_header_failed` | — | header read I/O error |
+| `read_block.read_index_entry_failed` | — | index lookup failure |
+| `read_block.block_size_mismatch` | — | index/header size disagree |
+| `read_block.block_size_too_large` | — | reject oversized block |
+| `read_block.success.duration_ms` | — | latency histogram |
+| `write_block.success` | — | per successful write |
+| `write_block.empty` | — | reject zero-length block |
+| `write_block.block_too_large` | — | reject oversized block |
+| `write_block.invalid_block_height` | — | reject height < min |
+| `write_block.block_exceeds_file_size` | — | reject block > max_data_file_size |
+| `write_block.offset_overflow` | — | u64 offset arithmetic overflow |
+| `write_block.out_of_order` | — | write filled a gap, not the next height |
+| `write_block.write_header_failed` | — | data-file header write failed |
+| `write_block.write_data_failed` | — | data-file payload write failed |
+| `write_block.success.duration_ms` | — | latency histogram |
+| `write_block.sync_duration_ms` | — | `fsync` latency under sync mode |
+| `cache.read` | `result=hit\|miss` | every cache lookup |
+| `cache.populate` | `outcome=ok\|oversize` | post-miss cache insert |
+| `cache.populate_on_write` | `outcome=ok\|oversize` | write-side cache insert |
+
+**Why it's useful:** the cache counters in particular answer the
+"is my cache budget reasonable?" question directly:
+`cache.read{result=hit}/cache.read{result=miss}` is the hit ratio,
+and `cache.populate{outcome=oversize}` flags entries the budget
+silently refused. The pattern (single counter name, structured
+labels) follows firewood — cheaper at query time than parallel
+hit/miss counter names, and easier to chart in Grafana/Prometheus.
+
 ### `max_contiguous_height` — incremental contiguity tracking
 
 **blockdb:** tracks `maxBlockHeight` (`database.go:189`) — the highest
@@ -104,36 +183,6 @@ field in the wrong place is a compile error (padding/alignment) instead
 of a silent on-disk format break. Index header reads and writes happen
 directly against the file buffer with zero intermediate allocations,
 which matters on hot startup paths.
-
-### Byte-budgeted block cache instead of entry count
-
-**blockdb:** `cacheDB` is sized by *number of cached entries* —
-`BlockCacheSize uint16` defaults to 256 (`config.go:14-15`). The cache
-holds up to 256 `BlockData` entries regardless of their size. Total
-memory usage is `256 × whatever_block_sizes_happen_to_be`, which on
-Avalanche can mean anywhere from a few hundred KiB (small P-chain
-blocks) to multiple GiB (large C-chain blocks). No memory-pressure
-guarantee.
-
-**Rust:** `CachedStore` uses [`lru-mem`](https://crates.io/crates/lru-mem),
-which evicts oldest entries until the total tracked heap occupancy
-stays under a *byte budget* (`StoreOptions::cache_size: NonZeroUsize`,
-in bytes). Block sizes vary; the byte budget gives a hard
-memory-pressure bound regardless of which blocks are hot.
-
-**Why it's better:** Operators can size the cache by "how much RAM I'm
-willing to spend on block caching" — a number they can actually reason
-about — instead of "how many entries, given block sizes I have to
-guess". For Avalanche specifically, where C-chain block sizes can be
-1000× larger than P-chain blocks, this is the difference between a
-predictable memory footprint and a per-workload surprise.
-
-**Implementation note:** `Block` is `Arc<[u8]>` rather than `Box<[u8]>`
-so cache hits are O(1) reference-count clones, not memcpy. A small
-newtype `CacheEntry` lets `Arc<[u8]>` participate in lru-mem's
-`HeapSize`-aware accounting; the cache over-counts when callers hold
-outstanding `Arc` clones, but always stays *under* its budget
-(conservative eviction, never an overflow).
 
 ---
 

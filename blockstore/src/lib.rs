@@ -1,3 +1,5 @@
+#[macro_use]
+mod metrics;
 mod cached_store;
 mod file_set;
 pub mod store;

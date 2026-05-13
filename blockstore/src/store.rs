@@ -59,36 +59,6 @@ impl Default for StoreOptions {
     }
 }
 
-#[cfg(feature = "metrics")]
-use metrics::counter;
-
-#[cfg(not(feature = "metrics"))]
-macro_rules! counter {
-    ($key:expr) => {{
-        struct FakeCounter;
-        impl FakeCounter {
-            pub fn increment(&self, _: u64) {
-                // do nothing
-            }
-        }
-        FakeCounter {}
-    }};
-}
-
-#[cfg(feature = "metrics")]
-macro_rules! record_duration {
-    ($start:expr, $key:expr) => {
-        let duration = coarsetime::Instant::now().duration_since($start);
-        counter!($key).increment(duration.as_millis() as u64);
-    };
-}
-#[cfg(not(feature = "metrics"))]
-macro_rules! record_duration {
-    ($start:expr, $key:expr) => {
-        // do nothing
-    };
-}
-
 #[derive(Clone, Debug, PartialEq, strum::Display)]
 #[strum(serialize_all = "lowercase")]
 #[repr(C)]
