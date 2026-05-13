@@ -105,8 +105,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             target,
             start_block,
         } => {
-            let target_index = target.join("index.idx");
-            let target_data = target.join("data.dat");
+            let target_index = target.join("blockdb.idx");
+            let target_data = target.join("blockdb_0.dat");
             let source_store = Store::new(
                 &index_path,
                 &data_path,

@@ -15,7 +15,6 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 blockstore = { path = "../blockstore" }
-bytemuck.workspace = true
 
 [build-dependencies]
 cbindgen.workspace = true 

@@ -225,7 +225,7 @@ pub fn import(
             let block: Block = combined.as_ref().into();
             store.write_block(body_key.height().unwrap(), &block, 0)?;
             count = count.checked_add(1).ok_or("Overflow")?;
-            if count % 100_000 == 0 {
+            if count.is_multiple_of(100_000) {
                 println!("Imported {count} blocks");
             }
         }
@@ -245,7 +245,7 @@ pub fn import(
             let block: Block = combined.as_ref().into();
             store.write_block(body_key.height().unwrap(), &block, 0)?;
             count = count.checked_add(1).ok_or("Overflow")?;
-            if count % 100_000 == 0 {
+            if count.is_multiple_of(100_000) {
                 println!("Imported {count} blocks");
             }
         }

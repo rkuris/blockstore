@@ -9,12 +9,13 @@ use std::fs::{File, OpenOptions};
 use std::io::{Error, ErrorKind, Write as _};
 use std::num::NonZeroUsize;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt, mem};
 
 use bytemuck::{Pod, Zeroable};
+
 use xxhash_rust::xxh64::xxh64;
 
 use crate::{Block, BlockHeight};
@@ -85,7 +86,7 @@ pub struct Store {
 pub struct IndexEntry {
     pub offset: u64,
     pub size: u32,
-    pub header_size: u32,
+    pub reserved: [u8; 4],
 }
 
 /// The header of the index file.
@@ -97,19 +98,16 @@ pub struct IndexEntry {
 pub struct IndexFileHeader {
     // The version of the index file format
     pub version: u64,
-    // The maximum size of the index file in MB
-    // We don't currently use this, but we reserve space for it in the index file
-    // This is used to allow the data file to be split at a given size
-    pub max_file_size: u64,
-    // The lowest block height in the index file
-    // TODO: this should be a BlockHeight
-    pub lowest_block_height: u64,
-    // The highest block height in the index file
-    pub highest_contiguous_block_height: u64,
-    // The highest block height in the index file
-    pub highest_block_height: u64,
-    // The size of the data file in bytes
-    pub data_file_size: u64,
+    // Matches Go's MaxDataFileSize field.
+    pub max_data_file_size: u64,
+    // The lowest block height tracked by this index.
+    pub min_height: u64,
+    // The highest block height written.
+    pub max_height: u64,
+    // The next write offset in the data file.
+    pub next_write_offset: u64,
+    // Reserved bytes to keep header size equal to Go implementation (64 bytes total).
+    pub reserved: [u8; 24],
 }
 
 impl IndexFileHeader {
@@ -117,7 +115,7 @@ impl IndexFileHeader {
 
     fn with_lowest_block_height(self, lowest_block_height: u64) -> Self {
         Self {
-            lowest_block_height,
+            min_height: lowest_block_height,
             ..self
         }
     }
@@ -127,29 +125,70 @@ impl Default for IndexFileHeader {
     fn default() -> Self {
         Self {
             version: Self::INDEX_FILE_VERSION,
-            max_file_size: 0,
-            lowest_block_height: 1,
-            highest_contiguous_block_height: 0,
-            highest_block_height: 0,
-            data_file_size: 0,
+            max_data_file_size: u64::MAX,
+            min_height: 1,
+            max_height: 0,
+            next_write_offset: 0,
+            reserved: [0; 24],
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
-#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 struct BlockHeader {
     height: u64,
-    checksum: u64,
     size: u32,
-    header_size: u32,
+    checksum: u64,
+    version: u16,
 }
 
 impl BlockHeader {
-    /// The maximum size of a block in the store.
-    ///
-    /// This is used to sanity check the block size.
-    const MAX_BLOCK_SIZE: u32 = 1 << 30; // 1GB
+    /// 1 GiB — sanity bound to reject corrupt headers during recovery.
+    const MAX_BLOCK_SIZE: u32 = 1 << 30;
+    const BLOCK_ENTRY_VERSION: u16 = 1;
+    const SERIALIZED_SIZE: usize = 8 + 4 + 8 + 2;
+
+    fn serialize(self) -> [u8; Self::SERIALIZED_SIZE] {
+        let mut buf = [0u8; Self::SERIALIZED_SIZE];
+        buf[0..8].copy_from_slice(&self.height.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.size.to_le_bytes());
+        buf[12..20].copy_from_slice(&self.checksum.to_le_bytes());
+        buf[20..22].copy_from_slice(&self.version.to_le_bytes());
+        buf
+    }
+
+    fn deserialize(buf: &[u8]) -> Result<Self, Error> {
+        fn take<const N: usize>(
+            buf: &[u8],
+            offset: usize,
+            field: &'static str,
+        ) -> Result<[u8; N], Error> {
+            offset
+                .checked_add(N)
+                .and_then(|end| buf.get(offset..end))
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, field))
+        }
+
+        if buf.len() != Self::SERIALIZED_SIZE {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "invalid block header size",
+            ));
+        }
+
+        let height = u64::from_le_bytes(take(buf, 0, "invalid block header height field")?);
+        let size = u32::from_le_bytes(take(buf, 8, "invalid block header size field")?);
+        let checksum = u64::from_le_bytes(take(buf, 12, "invalid block header checksum field")?);
+        let version = u16::from_le_bytes(take(buf, 20, "invalid block header version field")?);
+
+        Ok(Self {
+            height,
+            size,
+            checksum,
+            version,
+        })
+    }
 }
 
 /// Compresses the given data using Snappy compression.
@@ -210,8 +249,27 @@ fn decompress(compressed_data: &[u8]) -> Vec<u8> {
 }
 
 impl Store {
+    const INDEX_FILE_NAME: &'static str = "blockdb.idx";
+    const DATA_FILE_NAME: &'static str = "blockdb_0.dat";
+
     /// We write the header to the index file every 1024 blocks
     const CHECKPOINT_INTERVAL: u64 = 1024;
+
+    fn resolve_index_filename(path: &Path) -> PathBuf {
+        if path.is_dir() {
+            path.join(Self::INDEX_FILE_NAME)
+        } else {
+            path.to_path_buf()
+        }
+    }
+
+    fn resolve_data_filename(path: &Path) -> PathBuf {
+        if path.is_dir() {
+            path.join(Self::DATA_FILE_NAME)
+        } else {
+            path.to_path_buf()
+        }
+    }
 
     /// Creates a new store.
     ///
@@ -229,8 +287,8 @@ impl Store {
     ) -> Result<Self, Error> {
         let mut opts = OpenOptions::new();
 
-        let index_filename = index_path.with_extension("idx");
-        let data_filename = data_path.with_extension("dat");
+        let index_filename = Self::resolve_index_filename(index_path);
+        let data_filename = Self::resolve_data_filename(data_path);
         let opts = opts
             .create(truncate)
             .truncate(truncate)
@@ -272,58 +330,49 @@ impl Store {
         let data_file_actual_size = self.data_file.metadata()?.len();
 
         // if the data file is smaller than the index file, then we need to truncate the data file
-        if data_file_actual_size < self.header.data_file_size {
+        if data_file_actual_size < self.header.next_write_offset {
             return Err(Error::new(
                 ErrorKind::InvalidData,
                 "data file is smaller than the index file indicates",
             ));
         }
 
-        self.max_contiguous_height.store(
-            self.header.highest_contiguous_block_height,
-            Ordering::Relaxed,
-        );
+        self.max_contiguous_height
+            .store(self.header.max_height, Ordering::Relaxed);
         self.height_highwater
-            .store(self.header.highest_block_height, Ordering::Relaxed);
+            .store(self.header.max_height, Ordering::Relaxed);
 
         // if the data file is larger than the index file, then we need to read the data and
         // see if we can apply any of it
-        if data_file_actual_size > self.header.data_file_size {
+        if data_file_actual_size > self.header.next_write_offset {
             // start reading the data file until we reach the end
-            let mut block_header = BlockHeader::default();
-            while self
-                .data_file
-                .read_at(
-                    bytemuck::bytes_of_mut(&mut block_header),
-                    self.header.data_file_size,
-                )
-                .is_ok()
-            {
+            while let Ok(block_header) = self.read_block_header_at(self.header.next_write_offset) {
                 let height = block_header.height;
                 let size = block_header.size;
                 // sanity checks
-                if height < self.header.lowest_block_height {
+                if height < self.header.min_height {
                     break;
                 }
                 if size == 0 || size > BlockHeader::MAX_BLOCK_SIZE {
                     break;
                 }
-                if self.header.data_file_size.saturating_add(size.into()) > data_file_actual_size {
+                if self.header.next_write_offset.saturating_add(size.into()) > data_file_actual_size
+                {
                     break;
                 }
 
                 // block looks okay, lets read it. We know it's smaller than MAX_BLOCK_SIZE which
                 // will not overflow usize
 
-                self.header.data_file_size = self
+                self.header.next_write_offset = self
                     .header
-                    .data_file_size
-                    .wrapping_add(mem::size_of::<BlockHeader>() as u64);
+                    .next_write_offset
+                    .wrapping_add(BlockHeader::SERIALIZED_SIZE as u64);
 
                 #[allow(clippy::cast_possible_truncation)]
                 let mut compressed_block = vec![0; size as usize];
                 self.data_file
-                    .read_at(&mut compressed_block, self.header.data_file_size)?;
+                    .read_at(&mut compressed_block, self.header.next_write_offset)?;
 
                 // decompress the block data
                 let block = decompress(&compressed_block);
@@ -335,19 +384,23 @@ impl Store {
                 }
 
                 let index_entry = IndexEntry {
-                    offset: self.header.data_file_size,
+                    offset: self
+                        .header
+                        .next_write_offset
+                        .saturating_sub(BlockHeader::SERIALIZED_SIZE as u64),
                     size,
-                    header_size: 0,
+                    reserved: [0; 4],
                 };
                 self.update_index(height, index_entry)?;
                 self.update_highwater(height);
                 self.advance_max_contiguous_height(height);
 
-                self.header.data_file_size = self.header.data_file_size.wrapping_add(size.into());
+                self.header.next_write_offset =
+                    self.header.next_write_offset.wrapping_add(size.into());
             }
         }
 
-        *self.data_highwater.lock().unwrap() = self.header.data_file_size;
+        *self.data_highwater.lock().unwrap() = self.header.next_write_offset;
 
         Ok(())
     }
@@ -373,7 +426,7 @@ impl Store {
         &self,
         height: BlockHeight,
         block: &[u8],
-        header_size: u16,
+        _header_size: u16,
     ) -> Result<(), Error> {
         #[cfg(feature = "metrics")]
         let start = coarsetime::Instant::now();
@@ -384,15 +437,10 @@ impl Store {
             return Err(Error::new(ErrorKind::InvalidInput, "Block is empty"));
         }
 
-        let block_len: u32 = block
-            .len()
-            .try_into()
-            .unwrap_or(BlockHeader::MAX_BLOCK_SIZE);
-
-        if block_len == BlockHeader::MAX_BLOCK_SIZE {
+        let _: u32 = block.len().try_into().map_err(|_| {
             counter!("blockstore.write_block.block_too_large").increment(1);
-            return Err(Error::new(ErrorKind::InvalidInput, "Block too large"));
-        }
+            Error::new(ErrorKind::InvalidInput, "Block too large")
+        })?;
 
         // compress the block
         let compressed_block = compress(block);
@@ -409,7 +457,7 @@ impl Store {
         // just under MAX_U64, which is a mighty big buffer to be passing to this function...
         let size_with_header = compressed_block
             .len()
-            .checked_add(mem::size_of::<BlockHeader>())
+            .checked_add(BlockHeader::SERIALIZED_SIZE)
             .expect("blocks will never be so large as to overflow u64")
             as u64;
 
@@ -421,7 +469,7 @@ impl Store {
             height,
             size: compressed_block_len,
             checksum,
-            header_size: header_size.into(),
+            version: BlockHeader::BLOCK_ENTRY_VERSION,
         };
 
         // barring running out of space or an IO error, we can now be sure the block can be written,
@@ -440,7 +488,7 @@ impl Store {
         drop(guard);
 
         self.data_file
-            .write_all_at(bytemuck::bytes_of(&header), offset)
+            .write_all_at(&header.serialize(), offset)
             .inspect_err(|_| {
                 counter!("blockstore.write_block.write_header_failed").increment(1);
             })?;
@@ -452,7 +500,7 @@ impl Store {
         self.data_file
             .write_all_at(
                 &compressed_block,
-                offset.wrapping_add(mem::size_of::<BlockHeader>() as u64),
+                offset.wrapping_add(BlockHeader::SERIALIZED_SIZE as u64),
             )
             .inspect_err(|_| {
                 counter!("blockstore.write_block.write_data_failed").increment(1);
@@ -471,13 +519,13 @@ impl Store {
             IndexEntry {
                 offset,
                 size: compressed_block_len,
-                header_size: header_size.into(),
+                reserved: [0; 4],
             },
         )?;
 
         self.advance_max_contiguous_height(height);
 
-        if self.update_highwater(height) && height % Self::CHECKPOINT_INTERVAL == 0 {
+        if self.update_highwater(height) && height.is_multiple_of(Self::CHECKPOINT_INTERVAL) {
             self.checkpoint(saved_offset)?;
         }
 
@@ -487,7 +535,7 @@ impl Store {
                 if old < height { Some(height) } else { None }
             })
             .is_ok()
-            && height % Self::CHECKPOINT_INTERVAL == 0
+            && height.is_multiple_of(Self::CHECKPOINT_INTERVAL)
         {
             self.checkpoint(saved_offset)?;
         }
@@ -520,7 +568,7 @@ impl Store {
                     prev = prev.wrapping_add(1);
                     let next = prev.wrapping_add(1);
                     if let Ok(Some(entry)) = self.read_index_entry(next) {
-                        if entry.offset == 0 {
+                        if entry.offset == 0 && entry.size == 0 {
                             // we found a gap, so we can stop here
                             break;
                         }
@@ -568,9 +616,8 @@ impl Store {
             self.index_file.sync_all()?;
         }
         let mut header = self.header;
-        header.data_file_size = saved_offset;
-        header.highest_block_height = self.height_highwater.load(Ordering::Relaxed);
-        header.highest_contiguous_block_height = self.max_contiguous_height.load(Ordering::Relaxed);
+        header.next_write_offset = saved_offset;
+        header.max_height = self.height_highwater.load(Ordering::Relaxed);
         self.index_file
             .write_all_at(bytemuck::bytes_of(&header), 0)?;
         Ok(())
@@ -584,9 +631,15 @@ impl Store {
     /// or if an overflow occurs.
     fn index_entry_offset(&self, height: BlockHeight) -> Option<u64> {
         height
-            .checked_sub(self.header.lowest_block_height)?
+            .checked_sub(self.header.min_height)?
             .checked_mul(mem::size_of::<IndexEntry>() as u64)?
             .checked_add(mem::size_of::<IndexFileHeader>() as u64)
+    }
+
+    fn read_block_header_at(&self, offset: u64) -> Result<BlockHeader, Error> {
+        let mut buf = [0u8; BlockHeader::SERIALIZED_SIZE];
+        self.data_file.read_at(&mut buf, offset)?;
+        BlockHeader::deserialize(&buf)
     }
 
     fn read_index_entry(&self, height: BlockHeight) -> Result<Option<IndexEntry>, Error> {
@@ -631,12 +684,9 @@ impl Store {
         // TODO: we know the size and can read the whole header and data in one read...
 
         // read the block header
-        let mut blockheader = BlockHeader::default();
-        self.data_file
-            .read_at(bytemuck::bytes_of_mut(&mut blockheader), entry.offset)
-            .inspect_err(|_| {
-                counter!("blockstore.read_block.read_header_failed").increment(1);
-            })?;
+        let blockheader = self.read_block_header_at(entry.offset).inspect_err(|_| {
+            counter!("blockstore.read_block.read_header_failed").increment(1);
+        })?;
 
         if blockheader.size != block_size {
             counter!("blockstore.read_block.block_size_mismatch").increment(1);
@@ -661,7 +711,7 @@ impl Store {
             &mut compressed_block,
             entry
                 .offset
-                .checked_add(mem::size_of::<BlockHeader>() as u64)
+                .checked_add(BlockHeader::SERIALIZED_SIZE as u64)
                 .expect("block offset overflow"),
         )?;
 
@@ -686,47 +736,20 @@ impl Store {
     }
 
     pub fn min_block_height(&self) -> BlockHeight {
-        self.header.lowest_block_height
+        self.header.min_height
     }
 
-    /// Reads the header portion of a block at the specified height.
-    /// The size of the header was specified when the block was written.
-    ///
-    /// # Arguments
-    ///
-    /// * `height` - The height of the block to read
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Some(Block))` - The block header if found
-    /// * `Ok(None)` - If no block exists at the specified height
-    /// * `Err(Error)` - If there was an error reading the block
+    /// The Go-compatible format does not store a separate per-block header size,
+    /// so extracting a logical "block header" slice is not supported.
     ///
     /// # Errors
-    /// Returns an error if:
-    /// - The file cannot be read
-    /// - The block header cannot be decoded
-    /// - The block data cannot be read
+    /// Always returns `ErrorKind::Unsupported`.
     pub fn read_block_header(&self, height: BlockHeight) -> Result<Option<Block>, Error> {
-        let index = self.index_entry_offset(height).ok_or_else(|| {
-            counter!("blockstore.read_block_header.invalid_block_height").increment(1);
-            Error::new(ErrorKind::InvalidInput, "Invalid block height")
-        })?;
-
-        let entry = self.read_index_entry(height)?;
-        let Some(entry) = entry else {
-            return Ok(None);
-        };
-
-        let mut data = vec![0u8; entry.header_size as usize];
-        let offset = index
-            .checked_add(mem::size_of::<IndexFileHeader>() as u64)
-            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Overflow in offset calculation"))?
-            .checked_add(mem::size_of::<IndexEntry>() as u64)
-            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Overflow in offset calculation"))?;
-        self.data_file.read_at(&mut data, offset)?;
-
-        Ok(Some(data.into()))
+        let _ = height;
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "read_block_header is not supported by Go-compatible on-disk format",
+        ))
     }
 }
 
@@ -742,6 +765,7 @@ impl Drop for Store {
 
 #[cfg(test)]
 mod tests {
+    use std::mem;
     use std::mem::forget;
     use std::thread::{available_parallelism, scope};
 
@@ -749,16 +773,23 @@ mod tests {
 
     #[test]
     fn header_size_test() {
-        // TODO: can this be done at compile time?
         let header_size = mem::size_of::<IndexFileHeader>();
         let entry_size = mem::size_of::<IndexEntry>();
+        assert_eq!(64, header_size, "index header must match Go format");
+        assert_eq!(16, entry_size, "index entry must match Go format");
         assert!(
-            header_size % entry_size == 0,
-            "header size must be a multiple of the entry size"
+            header_size.is_multiple_of(entry_size),
+            "header size must be a multiple of entry size"
         );
-        assert!(
-            mem::align_of::<IndexFileHeader>() == mem::align_of::<IndexEntry>(),
-            "header and entry must have the same alignment"
+        assert_eq!(
+            mem::align_of::<IndexFileHeader>(),
+            mem::align_of::<IndexEntry>(),
+            "header and entry must have same alignment for zero-copy serialization"
+        );
+        assert_eq!(
+            22,
+            BlockHeader::SERIALIZED_SIZE,
+            "block entry header must match Go format"
         );
     }
 
@@ -873,5 +904,76 @@ mod tests {
         .unwrap();
         assert_eq!(1, store.max_contiguous_height());
         assert_eq!(1, store.height_highwater.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn default_filename_test() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let store = Store::new(
+            tmpdir.path(),
+            tmpdir.path(),
+            NonZeroUsize::new(1024).unwrap(),
+            true,
+            SyncMode::Async,
+            1,
+        )
+        .unwrap();
+
+        store.write_block(1, &[1, 2, 3, 4], 0).unwrap();
+
+        assert!(tmpdir.path().join(Store::INDEX_FILE_NAME).exists());
+        assert!(tmpdir.path().join(Store::DATA_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn height_zero_regression_test() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let first = vec![7; 256];
+        let second = vec![9; 128];
+
+        let store = Store::new(
+            tmpdir.path(),
+            tmpdir.path(),
+            NonZeroUsize::new(1024).unwrap(),
+            true,
+            SyncMode::Sync,
+            0,
+        )
+        .unwrap();
+
+        store.write_block(0, &first, 0).unwrap();
+        store.write_block(1, &second, 0).unwrap();
+
+        assert_eq!(
+            Some(first.clone().into_boxed_slice()),
+            store.read_block(0).unwrap()
+        );
+        assert_eq!(
+            Some(second.clone().into_boxed_slice()),
+            store.read_block(1).unwrap()
+        );
+        assert_eq!(1, store.max_contiguous_height());
+
+        forget(store);
+
+        let recovered = Store::new(
+            tmpdir.path(),
+            tmpdir.path(),
+            NonZeroUsize::new(1024).unwrap(),
+            false,
+            SyncMode::Sync,
+            999,
+        )
+        .unwrap();
+
+        assert_eq!(
+            Some(first.into_boxed_slice()),
+            recovered.read_block(0).unwrap()
+        );
+        assert_eq!(
+            Some(second.into_boxed_slice()),
+            recovered.read_block(1).unwrap()
+        );
+        assert_eq!(1, recovered.max_contiguous_height());
     }
 }
