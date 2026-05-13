@@ -491,7 +491,11 @@ impl Store {
             let block_header = self.read_block_header_at(scan)?;
             let height = block_header.height;
             let size = block_header.size;
-            if height < self.header.min_height || size == 0 || size > BlockHeader::MAX_BLOCK_SIZE {
+            if height < self.header.min_height
+                || size == 0
+                || size > BlockHeader::MAX_BLOCK_SIZE
+                || block_header.version != BlockHeader::BLOCK_ENTRY_VERSION
+            {
                 break;
             }
 
@@ -526,7 +530,14 @@ impl Store {
             };
             self.update_index(height, index_entry)?;
             self.update_highwater(height);
-            self.advance_max_contiguous_height(height);
+            // During recovery we walk strictly forward, so the cascade in
+            // `advance_max_contiguous_height` is unneeded and harmful: the
+            // existing index file may still contain entries from pre-crash
+            // writes for blocks we're about to reject (e.g. corrupt block
+            // headers in the scan range). `fetch_max` updates only based
+            // on what this loop has actually validated.
+            self.max_contiguous_height
+                .fetch_max(height, Ordering::AcqRel);
 
             self.header.next_write_offset = scan
                 .checked_add(BlockHeader::SERIALIZED_SIZE as u64)
@@ -1289,5 +1300,244 @@ mod tests {
         assert_eq!(Some(block_a.into()), reopened.read_block(1).unwrap());
         assert_eq!(Some(block_b.into()), reopened.read_block(2).unwrap());
         assert_eq!(2, reopened.max_contiguous_height());
+    }
+
+    // ---- recovery / corruption-detection tests -------------------------
+    //
+    // Ported from blockdb's `TestRecovery_CorruptionDetection`. Each test
+    // writes blocks, simulates a crash via `forget(store)` (so the index
+    // header stays stale and recovery does a fresh scan), corrupts a byte
+    // on disk, and asserts that the corrupted block (and all that follow)
+    // are not picked up by recovery.
+
+    /// Reads the BlockHeader.size field at `local_offset` in `blockdb_0.dat`.
+    /// Used to compute the on-disk offset of subsequent blocks.
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "test helper with known-small offsets"
+    )]
+    fn read_block_size_field(dir: &Path, local_offset: u64) -> u32 {
+        let path = dir.join("blockdb_0.dat");
+        let file = File::open(path).unwrap();
+        let mut buf = [0u8; 4];
+        // BlockHeader layout: height(8) || size(4) || checksum(8) || version(2)
+        file.read_at(&mut buf, local_offset + 8).unwrap();
+        u32::from_le_bytes(buf)
+    }
+
+    /// Writes a single byte at `local_offset` in `blockdb_0.dat`. Used to
+    /// flip specific fields of an on-disk block header or payload.
+    fn poke_byte(dir: &Path, local_offset: u64, value: u8) {
+        let path = dir.join("blockdb_0.dat");
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        file.write_all_at(&[value], local_offset).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    /// Writes `n` incompressible blocks at heights `1..=n` via the store,
+    /// then `forget`s the store so the index header stays stale and the
+    /// next open triggers a full data-file scan.
+    fn write_blocks_and_crash(dir: &Path, n: u64, block_size: usize) {
+        let store = Store::open(
+            dir,
+            dir,
+            StoreOptions {
+                truncate: true,
+                sync: SyncMode::Sync,
+                minimum_height: 1,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+        for h in 1..=n {
+            store
+                .write_block(h, &incompressible(h, block_size))
+                .unwrap();
+        }
+        forget(store);
+    }
+
+    fn reopen(dir: &Path) -> Result<Store, Error> {
+        Store::open(
+            dir,
+            dir,
+            StoreOptions {
+                truncate: false,
+                sync: SyncMode::Sync,
+                minimum_height: 1,
+                ..StoreOptions::default()
+            },
+        )
+    }
+
+    /// A bit-flip in the compressed payload changes the xxh64 of the
+    /// decompressed bytes, so recovery rejects the block.
+    #[test]
+    fn recovery_detects_checksum_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        write_blocks_and_crash(dir.path(), 4, 256);
+
+        // Corrupt one byte inside block 2's payload. Block 1's total size
+        // on disk is HEADER + compressed_size_of_block_1; that's where
+        // block 2's header starts. Flip a byte 32 into block 2's payload.
+        let block_1_compressed = read_block_size_field(dir.path(), 0);
+        let block_2_offset = u64::from(block_1_compressed) + BlockHeader::SERIALIZED_SIZE as u64;
+        let block_2_payload_offset = block_2_offset + BlockHeader::SERIALIZED_SIZE as u64;
+        poke_byte(dir.path(), block_2_payload_offset + 32, 0xFF);
+
+        let store = reopen(dir.path()).unwrap();
+        // Block 1 was recovered; block 2 onward was rejected by the scan.
+        assert_eq!(1, store.max_contiguous_height());
+        assert!(store.read_block(1).unwrap().is_some());
+        // Block 2's index entry survives from before the crash, so a
+        // direct read goes to disk and surfaces the corruption as
+        // `InvalidData` rather than `None`.
+        let err = store.read_block(2).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    /// Setting the block's `size` field above `MAX_BLOCK_SIZE` makes the
+    /// header fail sanity, so recovery stops at it.
+    #[test]
+    fn recovery_detects_invalid_block_size() {
+        let dir = tempfile::tempdir().unwrap();
+        write_blocks_and_crash(dir.path(), 4, 256);
+
+        let block_1_compressed = read_block_size_field(dir.path(), 0);
+        let block_2_offset = u64::from(block_1_compressed) + BlockHeader::SERIALIZED_SIZE as u64;
+        // Write a huge size value (4 bytes at block_2_offset + 8).
+        let huge: u32 = BlockHeader::MAX_BLOCK_SIZE + 1;
+        let path = dir.path().join("blockdb_0.dat");
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        file.write_all_at(&huge.to_le_bytes(), block_2_offset + 8)
+            .unwrap();
+        file.sync_all().unwrap();
+
+        let store = reopen(dir.path()).unwrap();
+        assert_eq!(1, store.max_contiguous_height());
+    }
+
+    /// Recovery rejects blocks whose version doesn't match the writer's
+    /// expected version constant.
+    #[test]
+    fn recovery_detects_invalid_version() {
+        let dir = tempfile::tempdir().unwrap();
+        write_blocks_and_crash(dir.path(), 4, 256);
+
+        let block_1_compressed = read_block_size_field(dir.path(), 0);
+        let block_2_offset = u64::from(block_1_compressed) + BlockHeader::SERIALIZED_SIZE as u64;
+        // BlockHeader version is at offset 20 (u16 LE).
+        let path = dir.path().join("blockdb_0.dat");
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        file.write_all_at(&99u16.to_le_bytes(), block_2_offset + 20)
+            .unwrap();
+        file.sync_all().unwrap();
+
+        let store = reopen(dir.path()).unwrap();
+        assert_eq!(1, store.max_contiguous_height());
+    }
+
+    /// Recovery rejects blocks with `size == 0` in the header.
+    #[test]
+    fn recovery_detects_zero_block_size() {
+        let dir = tempfile::tempdir().unwrap();
+        write_blocks_and_crash(dir.path(), 4, 256);
+
+        let block_1_compressed = read_block_size_field(dir.path(), 0);
+        let block_2_offset = u64::from(block_1_compressed) + BlockHeader::SERIALIZED_SIZE as u64;
+        let path = dir.path().join("blockdb_0.dat");
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        file.write_all_at(&0u32.to_le_bytes(), block_2_offset + 8)
+            .unwrap();
+        file.sync_all().unwrap();
+
+        let store = reopen(dir.path()).unwrap();
+        assert_eq!(1, store.max_contiguous_height());
+    }
+
+    /// Recovery rejects blocks whose height falls below `min_height`.
+    #[test]
+    fn recovery_detects_invalid_height() {
+        let dir = tempfile::tempdir().unwrap();
+        // Open with min_height=5; corrupt block 2's height to 1.
+        let store = Store::open(
+            dir.path(),
+            dir.path(),
+            StoreOptions {
+                truncate: true,
+                sync: SyncMode::Sync,
+                minimum_height: 5,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+        for h in 5..=8 {
+            store.write_block(h, &incompressible(h, 256)).unwrap();
+        }
+        forget(store);
+
+        let block_1_compressed = read_block_size_field(dir.path(), 0);
+        let block_2_offset = u64::from(block_1_compressed) + BlockHeader::SERIALIZED_SIZE as u64;
+        let path = dir.path().join("blockdb_0.dat");
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        // Write height=1 (below min_height of 5).
+        file.write_all_at(&1u64.to_le_bytes(), block_2_offset)
+            .unwrap();
+        file.sync_all().unwrap();
+
+        let store = Store::open(
+            dir.path(),
+            dir.path(),
+            StoreOptions {
+                truncate: false,
+                sync: SyncMode::Sync,
+                minimum_height: 5,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+        // Only block 5 (the first one) is recovered.
+        assert_eq!(5, store.max_contiguous_height());
+    }
+
+    /// A data file truncated mid-payload (the block header is intact but
+    /// the payload runs past EOF) is detected: that block and any after
+    /// are not recovered.
+    #[test]
+    fn recovery_handles_partial_block_at_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        write_blocks_and_crash(dir.path(), 4, 256);
+
+        // Truncate the file 8 bytes into block 2's payload.
+        let block_1_compressed = read_block_size_field(dir.path(), 0);
+        let block_2_offset = u64::from(block_1_compressed) + BlockHeader::SERIALIZED_SIZE as u64;
+        let truncate_to = block_2_offset + BlockHeader::SERIALIZED_SIZE as u64 + 8;
+        let path = dir.path().join("blockdb_0.dat");
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        file.set_len(truncate_to).unwrap();
+        file.sync_all().unwrap();
+
+        let store = reopen(dir.path()).unwrap();
+        assert_eq!(1, store.max_contiguous_height());
+    }
+
+    /// Garbage bytes where a block header should be (all 0xFF) fails the
+    /// sanity check on the size field (>= `MAX_BLOCK_SIZE`) and on the
+    /// version field, so recovery stops cleanly.
+    #[test]
+    fn recovery_handles_garbage_block_header() {
+        let dir = tempfile::tempdir().unwrap();
+        write_blocks_and_crash(dir.path(), 4, 256);
+
+        let block_1_compressed = read_block_size_field(dir.path(), 0);
+        let block_2_offset = u64::from(block_1_compressed) + BlockHeader::SERIALIZED_SIZE as u64;
+        let path = dir.path().join("blockdb_0.dat");
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        let garbage = [0xFFu8; BlockHeader::SERIALIZED_SIZE];
+        file.write_all_at(&garbage, block_2_offset).unwrap();
+        file.sync_all().unwrap();
+
+        let store = reopen(dir.path()).unwrap();
+        assert_eq!(1, store.max_contiguous_height());
     }
 }
