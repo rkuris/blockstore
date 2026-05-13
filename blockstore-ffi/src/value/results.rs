@@ -2,6 +2,7 @@ use std::any::Any;
 #[cfg(panic = "unwind")]
 use std::error::Error as StdError;
 use std::fmt;
+use std::sync::Arc;
 
 use blockstore::Store;
 
@@ -97,11 +98,14 @@ pub enum BlockResult {
     Err(OwnedBytes),
 }
 
-impl<E: fmt::Display> From<Result<Option<Box<[u8]>>, E>> for BlockResult {
-    fn from(value: Result<Option<Box<[u8]>>, E>) -> Self {
+impl<E: fmt::Display> From<Result<Option<Arc<[u8]>>, E>> for BlockResult {
+    fn from(value: Result<Option<Arc<[u8]>>, E>) -> Self {
         match value {
             Ok(None) => BlockResult::None,
-            Ok(Some(data)) => BlockResult::Some(data.into()),
+            // The FFI boundary copies into an OwnedBytes owned by C, so
+            // a single allocation here is unavoidable. We collect the
+            // shared slice into a fresh Box for that copy.
+            Ok(Some(data)) => BlockResult::Some(data.to_vec().into_boxed_slice().into()),
             Err(err) => BlockResult::Err(err.to_string().into_bytes().into()),
         }
     }

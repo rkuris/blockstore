@@ -85,7 +85,17 @@ in the wrong place is a compile error (padding/alignment) instead of a
 silent on-disk format break. Zero hand-written offset arithmetic in the
 serialiser.
 
-## 5. Automatic cleanup via `Drop`
+## 5. Byte-budgeted block cache instead of entry count
+
+**blockdb:** `cacheDB` is sized by *number of cached entries* — `BlockCacheSize uint16` defaults to 256 (`config.go:14-15`). The cache holds up to 256 `BlockData` entries regardless of their size. Total memory usage is `256 × whatever_block_sizes_happen_to_be`, which on Avalanche can mean anywhere from a few hundred KiB (small P-chain blocks) to multiple GiB (large C-chain blocks). No memory-pressure guarantee.
+
+**Rust:** `CachedStore` uses [`lru-mem`](https://crates.io/crates/lru-mem), which evicts oldest entries until the total tracked heap occupancy stays under a *byte budget* (`StoreOptions::cache_size: NonZeroUsize`, in bytes). Block sizes vary; the byte budget gives a hard memory-pressure bound regardless of which blocks are hot.
+
+**Why it's better:** Operators can size the cache by "how much RAM I'm willing to spend on block caching" — a number they can actually reason about — instead of "how many entries, given block sizes I have to guess". For Avalanche specifically, where C-chain block sizes can be 1000× larger than P-chain blocks, this is the difference between a predictable memory footprint and a per-workload surprise.
+
+**Implementation note:** `Block` is `Arc<[u8]>` rather than `Box<[u8]>` so cache hits are O(1) reference-count clones, not memcpy. A small newtype `CacheEntry` lets `Arc<[u8]>` participate in lru-mem's `HeapSize`-aware accounting; the cache over-counts when callers hold outstanding `Arc` clones, but always stays *under* its budget (conservative eviction, never an overflow).
+
+## 6. Automatic cleanup via `Drop`
 
 **blockdb:** `Close()` must be called explicitly. Forgetting to call it
 leaks file handles and skips the final index-header checkpoint, forcing

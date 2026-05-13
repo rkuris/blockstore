@@ -11,11 +11,10 @@ use std::mem;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytemuck::{Pod, Zeroable};
-
+use parking_lot::Mutex;
 use xxhash_rust::xxh64::xxh64;
 
 use crate::file_set::{self, FileSet};
@@ -446,7 +445,7 @@ impl Store {
             self.recover_unindexed_blocks(calculated_next_write_offset, &data_files)?;
         }
 
-        *self.data_highwater.lock().unwrap() = self.header.next_write_offset;
+        *self.data_highwater.lock() = self.header.next_write_offset;
         Ok(())
     }
 
@@ -695,7 +694,7 @@ impl Store {
             ));
         }
 
-        let mut guard = self.data_highwater.lock().unwrap();
+        let mut guard = self.data_highwater.lock();
         let current = *guard;
 
         let write_offset = match max {
@@ -944,7 +943,7 @@ impl Drop for Store {
             self.index_file.sync_all().unwrap();
         }
         // if this fails, no biggie, we'll just have to do recovery at startup
-        let _ = self.checkpoint(*self.data_highwater.lock().unwrap());
+        let _ = self.checkpoint(*self.data_highwater.lock());
     }
 }
 
@@ -993,7 +992,7 @@ mod tests {
         let block = vec![32; 1024];
         store.write_block(1, &block).unwrap();
         let block_read = store.read_block(1).unwrap().unwrap();
-        assert_eq!(block.into_boxed_slice(), block_read);
+        assert_eq!(&block[..], &*block_read);
 
         // check the maximum contiguous height
         assert_eq!(1, store.max_contiguous_height());
@@ -1070,9 +1069,7 @@ mod tests {
         assert_eq!(1, store.height_highwater.load(Ordering::Relaxed));
 
         // force a checkpoint
-        store
-            .checkpoint(*store.data_highwater.lock().unwrap())
-            .unwrap();
+        store.checkpoint(*store.data_highwater.lock()).unwrap();
 
         // simulate a crash
         forget(store);
@@ -1129,14 +1126,8 @@ mod tests {
         store.write_block(0, &first).unwrap();
         store.write_block(1, &second).unwrap();
 
-        assert_eq!(
-            Some(first.clone().into_boxed_slice()),
-            store.read_block(0).unwrap()
-        );
-        assert_eq!(
-            Some(second.clone().into_boxed_slice()),
-            store.read_block(1).unwrap()
-        );
+        assert_eq!(Some(first.clone().into()), store.read_block(0).unwrap());
+        assert_eq!(Some(second.clone().into()), store.read_block(1).unwrap());
         assert_eq!(1, store.max_contiguous_height());
 
         forget(store);
@@ -1151,14 +1142,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            Some(first.into_boxed_slice()),
-            recovered.read_block(0).unwrap()
-        );
-        assert_eq!(
-            Some(second.into_boxed_slice()),
-            recovered.read_block(1).unwrap()
-        );
+        assert_eq!(Some(first.into()), recovered.read_block(0).unwrap());
+        assert_eq!(Some(second.into()), recovered.read_block(1).unwrap());
         assert_eq!(1, recovered.max_contiguous_height());
     }
 
@@ -1208,14 +1193,8 @@ mod tests {
         store.write_block(2, &block_b).unwrap();
 
         // Both blocks should round-trip.
-        assert_eq!(
-            Some(block_a.clone().into_boxed_slice()),
-            store.read_block(1).unwrap()
-        );
-        assert_eq!(
-            Some(block_b.clone().into_boxed_slice()),
-            store.read_block(2).unwrap()
-        );
+        assert_eq!(Some(block_a.clone().into()), store.read_block(1).unwrap());
+        assert_eq!(Some(block_b.clone().into()), store.read_block(2).unwrap());
 
         // Both data files should exist; file 1 holds the second block.
         let file0 = tmpdir.path().join("blockdb_0.dat");
@@ -1256,18 +1235,9 @@ mod tests {
         }
 
         let reopened = open_with_cap(tmpdir.path(), cap, false, 1).unwrap();
-        assert_eq!(
-            Some(block_a.into_boxed_slice()),
-            reopened.read_block(1).unwrap()
-        );
-        assert_eq!(
-            Some(block_b.into_boxed_slice()),
-            reopened.read_block(2).unwrap()
-        );
-        assert_eq!(
-            Some(block_c.into_boxed_slice()),
-            reopened.read_block(3).unwrap()
-        );
+        assert_eq!(Some(block_a.into()), reopened.read_block(1).unwrap());
+        assert_eq!(Some(block_b.into()), reopened.read_block(2).unwrap());
+        assert_eq!(Some(block_c.into()), reopened.read_block(3).unwrap());
         assert_eq!(3, reopened.max_contiguous_height());
     }
 
@@ -1316,14 +1286,8 @@ mod tests {
 
         // Recover and verify both blocks come back.
         let reopened = open_with_cap(tmpdir.path(), cap, false, 1).unwrap();
-        assert_eq!(
-            Some(block_a.into_boxed_slice()),
-            reopened.read_block(1).unwrap()
-        );
-        assert_eq!(
-            Some(block_b.into_boxed_slice()),
-            reopened.read_block(2).unwrap()
-        );
+        assert_eq!(Some(block_a.into()), reopened.read_block(1).unwrap());
+        assert_eq!(Some(block_b.into()), reopened.read_block(2).unwrap());
         assert_eq!(2, reopened.max_contiguous_height());
     }
 }

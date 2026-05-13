@@ -10,7 +10,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Error, ErrorKind};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 const DATA_FILE_PREFIX: &str = "blockdb_";
 const DATA_FILE_SUFFIX: &str = ".dat";
@@ -197,7 +199,7 @@ impl FileSet {
             .open(&path)?;
         let new_handle = Arc::new(file);
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if let Some(existing) = inner.handles.get(&index).cloned() {
             inner.touch(index);
             return Ok(existing);
@@ -223,7 +225,7 @@ impl FileSet {
         )
     )]
     pub(crate) fn evict(&self, index: u32) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.remove(index);
     }
 
@@ -234,7 +236,7 @@ impl FileSet {
     where
         F: FnMut(u32, &File),
     {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         for &idx in &inner.order {
             if let Some(handle) = inner.handles.get(&idx) {
                 f(idx, handle.as_ref());
@@ -243,7 +245,7 @@ impl FileSet {
     }
 
     fn lookup(&self, index: u32) -> Option<Arc<File>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let handle = inner.handles.get(&index).cloned()?;
         inner.touch(index);
         Some(handle)
