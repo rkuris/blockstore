@@ -1,198 +1,156 @@
 #![allow(clippy::cargo_common_metadata)]
 
-use std::ffi::{CStr, CString, OsStr, c_char};
+mod value;
+
+use std::ffi::OsStr;
+use std::io::{Error as IoError, ErrorKind};
 use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStrExt as _;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::{ptr, slice};
 
 use blockstore::{BlockHeight, Store, SyncMode};
 
+pub use crate::value::*;
+use crate::value::{CResult, NullHandleResult};
+
+/// Invokes a closure and returns the result as a [`CResult`].
+///
+/// If the closure panics, it returns [`CResult::from_panic`] with the panic
+/// information.
+#[inline]
+fn invoke<T: CResult, V: Into<T>>(once: impl FnOnce() -> V) -> T {
+    #[cfg(panic = "unwind")]
+    match catch_unwind(AssertUnwindSafe(once)) {
+        Ok(result) => result.into(),
+        Err(panic) => T::from_panic(panic),
+    }
+
+    #[cfg(not(panic = "unwind"))]
+    {
+        once().into()
+    }
+}
+
+/// Invokes a closure with a non-null handle, dispatching to the null-handle
+/// error variant if the handle is `None`.
+#[inline]
+fn invoke_with_handle<H, T: NullHandleResult, V: Into<T>>(
+    handle: Option<H>,
+    once: impl FnOnce(H) -> V,
+) -> T {
+    match handle {
+        Some(handle) => invoke(move || once(handle)),
+        None => T::null_handle_pointer_error(),
+    }
+}
+
+/// Arguments for opening or creating a [`Store`]. Passed to [`bs_open_store`].
 #[repr(C)]
 #[allow(clippy::arbitrary_source_item_ordering)]
-pub struct CreateOrOpenArgs {
-    path: *const c_char,
-    cache_size: usize,
-    truncate: bool,
-    sync: SyncMode,
+pub struct StoreArgs<'a> {
+    /// The filesystem path used for both the index and the data files. Must
+    /// be valid UTF-8.
+    pub path: BorrowedBytes<'a>,
+    /// Read cache size, in bytes. Must be greater than zero.
+    pub cache_size: usize,
+    /// If true, the store is truncated when opened.
+    pub truncate: bool,
+    /// Sync mode for writes.
+    pub sync: SyncMode,
 }
 
-/// Adds a block to the store.
+/// Opens (or creates) a [`Store`].
 ///
-/// Returns 0 on success, or an error code on failure.
+/// # Returns
 ///
-/// Fails if the block ID is zero.
-///
-/// # Safety
-/// The caller must ensure that:
-/// - `block` is a valid pointer to a `Block` structure
-/// - The `data` field of the `Block` points to valid memory for the specified `len`
-///
-/// # Panics
-/// Panics if `store` or `block` is a null pointer.
+/// - [`StoreHandleResult::Ok`] with an opaque handle on success. The caller
+///   must pass the handle to [`bs_close_store`] when done.
+/// - [`StoreHandleResult::Err`] with a UTF-8 error message otherwise. The
+///   caller must call [`bs_free_owned_bytes`] on the message.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn write_block(
-    store: *const Store,
+pub extern "C" fn bs_open_store(args: StoreArgs<'_>) -> StoreHandleResult {
+    invoke(move || -> Result<Store, IoError> {
+        let path_str = args
+            .path
+            .as_str()
+            .map_err(|e| IoError::new(ErrorKind::InvalidData, e))?;
+        let path: &Path = OsStr::from_bytes(path_str.as_bytes()).as_ref();
+        let cache_size = NonZeroUsize::new(args.cache_size)
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "cache_size must be > 0"))?;
+        Store::new(path, path, cache_size, args.truncate, args.sync, 1)
+    })
+}
+
+/// Closes a [`Store`] previously returned by [`bs_open_store`].
+///
+/// # Returns
+///
+/// - [`VoidResult::NullHandlePointer`] if `store` is null.
+/// - [`VoidResult::Ok`] otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn bs_close_store(store: Option<Box<Store>>) -> VoidResult {
+    invoke_with_handle(store, |store| {
+        drop(store);
+    })
+}
+
+/// Writes a block at `height` to the store.
+///
+/// # Returns
+///
+/// - [`VoidResult::NullHandlePointer`] if `store` is null.
+/// - [`VoidResult::Ok`] on success.
+/// - [`VoidResult::Err`] with a UTF-8 message otherwise. The caller must call
+///   [`bs_free_owned_bytes`] on the message.
+#[unsafe(no_mangle)]
+pub extern "C" fn bs_write_block(
+    store: Option<&Store>,
     height: BlockHeight,
-    block_len: usize,
-    block_data: *const u8,
+    data: BorrowedBytes<'_>,
     header_size: u16,
-) -> *const c_char {
-    let store = unsafe { store.as_ref().unwrap() };
-    let block = unsafe { slice::from_raw_parts(block_data, block_len) };
-    match store.write_block(height, block, header_size) {
-        Ok(()) => ptr::null(),
-        // TODO: error strings leak memory :()
-        Err(e) => CString::new(e.to_string()).unwrap().into_raw(),
+) -> VoidResult {
+    invoke_with_handle(store, move |store| {
+        store.write_block(height, data.as_slice(), header_size)
+    })
+}
+
+/// Reads the block at `height` from the store.
+///
+/// # Returns
+///
+/// - [`BlockResult::NullHandlePointer`] if `store` is null.
+/// - [`BlockResult::None`] if no block exists at `height`.
+/// - [`BlockResult::Some`] with the block bytes. The caller must call
+///   [`bs_free_owned_bytes`] on the returned data.
+/// - [`BlockResult::Err`] with a UTF-8 message otherwise. The caller must call
+///   [`bs_free_owned_bytes`] on the message.
+#[unsafe(no_mangle)]
+pub extern "C" fn bs_read_block(store: Option<&Store>, height: BlockHeight) -> BlockResult {
+    invoke_with_handle(store, move |store| store.read_block(height))
+}
+
+/// Reads the block header at `height` from the store.
+///
+/// See [`bs_read_block`] for the return semantics.
+#[unsafe(no_mangle)]
+pub extern "C" fn bs_read_block_header(store: Option<&Store>, height: BlockHeight) -> BlockResult {
+    invoke_with_handle(store, move |store| store.read_block_header(height))
+}
+
+/// Returns the maximum contiguous block height of the store, or 0 if `store`
+/// is null.
+#[unsafe(no_mangle)]
+pub extern "C" fn bs_max_contiguous_height(store: Option<&Store>) -> BlockHeight {
+    match store {
+        Some(store) => store.max_contiguous_height(),
+        None => 0,
     }
 }
 
-#[repr(C)]
-pub struct FfiBlock {
-    data: *mut u8,
-    len: usize,
-}
-
-/// Retrieves a block by its ID.
-///
-/// If the block cannot be found, it returns a block with a
-/// zero length and null pointer. If an error occurs, it returns
-/// a C string containing the error message and a zero size.
-///
-/// # Errors
-/// Returns an error if:
-/// - The file cannot be read
-/// - The block header cannot be decoded
-/// - The block data cannot be read
-///
-/// # Safety
-/// The caller must ensure that `store` is a valid pointer to a `Store` instance.
-///
-/// # Panics
-/// Panics if `store` is a null pointer.
+/// Frees memory associated with an [`OwnedBytes`] previously returned from an
+/// FFI call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn read_block(store: *const Store, id: BlockHeight) -> FfiBlock {
-    let store = unsafe { store.as_ref().unwrap() };
-    match store.read_block(id) {
-        Ok(Some(block)) => {
-            let leaked = Box::leak(block);
-            FfiBlock {
-                data: leaked.as_mut_ptr(),
-                len: leaked.len(),
-            }
-        }
-        Ok(None) => FfiBlock {
-            data: ptr::null_mut(),
-            len: 0,
-        },
-        Err(e) => FfiBlock {
-            data: CString::new(e.to_string()).unwrap().into_raw().cast::<u8>(),
-            len: 0,
-        },
-    }
-}
-
-/// Retrieves a block header by its ID.
-///
-/// If the block cannot be found, it returns a block with a
-/// zero length and null pointer. If an error occurs, it returns
-/// a C string containing the error message and a zero size.
-///
-/// # Errors
-/// Returns an error if:
-/// - The file cannot be read
-/// - The block header cannot be decoded
-/// - The block data cannot be read
-///
-/// # Safety
-/// The caller must ensure that `store` is a valid pointer to a `Store` instance.
-///
-/// # Panics
-/// Panics if `store` is a null pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn read_block_header(store: *const Store, id: BlockHeight) -> FfiBlock {
-    let store = unsafe { store.as_ref().unwrap() };
-    match store.read_block_header(id) {
-        Ok(Some(block)) => {
-            let leaked = Box::leak(block);
-            FfiBlock {
-                data: leaked.as_mut_ptr(),
-                len: leaked.len(),
-            }
-        }
-        Ok(None) => FfiBlock {
-            data: ptr::null_mut(),
-            len: 0,
-        },
-        Err(e) => FfiBlock {
-            data: CString::new(e.to_string()).unwrap().into_raw().cast::<u8>(),
-            len: 0,
-        },
-    }
-}
-
-/// Frees a previous return from `read_block` or `read_block_header`
-///
-/// # Safety
-/// The caller must ensure that `data` is a valid pointer to a block.
-///
-/// # Panics
-/// Panics if `data` is a null pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn free_block(block: FfiBlock) {
-    let slice = unsafe { slice::from_raw_parts_mut(block.data, block.len) };
-    let boxed = unsafe { Box::from_raw(slice) };
-    drop(boxed);
-}
-
-/// Creates a new store instance. Returns a pointer to the store, or null if the store cannot be created.
-///
-/// # Safety
-/// The caller must ensure to call `free_store` on the returned pointer when done.
-///
-/// # Panics
-/// Panics if `args` is a null pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn new_store(args: CreateOrOpenArgs) -> *const Store {
-    let path = unsafe { CStr::from_ptr(args.path) };
-    let path: &Path = OsStr::from_bytes(path.to_bytes()).as_ref();
-
-    let cache_size = args.cache_size;
-    let truncate = args.truncate;
-    let Some(cache_size) = NonZeroUsize::new(cache_size) else {
-        return ptr::null_mut();
-    };
-
-    match Store::new(path, path, cache_size, truncate, args.sync, 1) {
-        Ok(store) => Box::into_raw(Box::new(store)),
-        Err(_) => ptr::null_mut(),
-    }
-}
-
-/// Returns the maximum contiguous height of the store.
-///
-/// # Safety
-/// The caller must ensure that `store` is a valid pointer to a `FfiStore` instance.
-///
-/// # Panics
-/// Panics if `store` is a null pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn max_contiguous_height(store: *const Store) -> BlockHeight {
-    let store = unsafe { store.as_ref().unwrap() };
-    store.max_contiguous_height()
-}
-
-/// Frees a store instance.
-///
-/// # Safety
-/// The caller must ensure:
-/// - `store` is a valid pointer returned by `new_store`
-/// - `store` has not been freed before
-/// - No other references to `store` exist
-///
-/// # Panics
-/// Panics if the safety lock cannot be acquired.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn free_store(store: *mut Store) {
-    drop(unsafe { Box::from_raw(store) });
+pub extern "C" fn bs_free_owned_bytes(bytes: OwnedBytes) -> VoidResult {
+    invoke(move || drop(bytes))
 }

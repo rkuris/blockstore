@@ -1,18 +1,38 @@
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 extern crate cbindgen;
 
 fn main() {
-    let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let out_dir = PathBuf::from(&env::var("OUT_DIR").unwrap());
+    let crate_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set");
 
-    let config = cbindgen::Config::from_file("cbindgen.toml").unwrap_or_default();
+    println!("cargo:rerun-if-changed=cbindgen.toml");
+    println!("cargo:rerun-if-changed=build.rs");
+    let src_dir = PathBuf::from(&crate_dir).join("src");
+    rerun_if_rust_changed(&src_dir);
 
-    cbindgen::Builder::new()
+    let config = cbindgen::Config::from_file("cbindgen.toml").expect("cbindgen.toml is present");
+
+    let bindings = cbindgen::Builder::new()
         .with_crate(crate_dir)
         .with_config(config)
         .generate()
-        .expect("Unable to generate bindings")
-        .write_to_file(out_dir.join("blockstore.h"));
+        .expect("unable to generate bindings");
+
+    bindings.write_to_file("src/blockstore.h");
+}
+
+fn rerun_if_rust_changed(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            rerun_if_rust_changed(&path);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
 }

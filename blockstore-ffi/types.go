@@ -13,8 +13,9 @@ const (
 )
 
 type StoreInterface interface {
-	WriteBlock(block Block) error
-	ReadBlock(id uint64) ([]byte, error)
+	WriteBlock(block Block, headerSize uint16) error
+	ReadBlock(height uint64) ([]byte, error)
+	ReadBlockHeader(height uint64) ([]byte, error)
 	MaxContiguousHeight() uint64
-	Close()
+	Close() error
 }
