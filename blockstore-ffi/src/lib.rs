@@ -4,12 +4,12 @@ mod value;
 
 use std::ffi::OsStr;
 use std::io::{Error as IoError, ErrorKind};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::ffi::OsStrExt as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
-use blockstore::{BlockHeight, Store, SyncMode};
+use blockstore::{BlockHeight, DEFAULT_MAX_DATA_FILES, Store, StoreOptions, SyncMode};
 
 pub use crate::value::*;
 use crate::value::{CResult, NullHandleResult};
@@ -54,6 +54,14 @@ pub struct StoreArgs<'a> {
     pub path: BorrowedBytes<'a>,
     /// Read cache size, in bytes. Must be greater than zero.
     pub cache_size: usize,
+    /// Maximum size of a single data file in bytes. `0` means unlimited
+    /// (single-file mode); any other value caps each `blockdb_N.dat` file
+    /// at that many bytes and rolls into the next file when a block would
+    /// cross the boundary.
+    pub max_data_file_size: u64,
+    /// Maximum number of open data-file handles to keep cached. `0` means
+    /// use the default ([`DEFAULT_MAX_DATA_FILES`]).
+    pub max_data_files: usize,
     /// If true, the store is truncated when opened.
     pub truncate: bool,
     /// Sync mode for writes.
@@ -78,7 +86,23 @@ pub extern "C" fn bs_open_store(args: StoreArgs<'_>) -> StoreHandleResult {
         let path: &Path = OsStr::from_bytes(path_str.as_bytes()).as_ref();
         let cache_size = NonZeroUsize::new(args.cache_size)
             .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "cache_size must be > 0"))?;
-        Store::new(path, path, cache_size, args.truncate, args.sync, 1)
+        let max_data_files = if args.max_data_files == 0 {
+            DEFAULT_MAX_DATA_FILES
+        } else {
+            args.max_data_files
+        };
+        Store::open(
+            path,
+            path,
+            StoreOptions {
+                cache_size,
+                truncate: args.truncate,
+                sync: args.sync,
+                minimum_height: 1,
+                max_data_file_size: NonZeroU64::new(args.max_data_file_size),
+                max_data_files,
+            },
+        )
     })
 }
 

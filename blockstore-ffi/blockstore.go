@@ -19,19 +19,35 @@ type Store struct {
 	handle *C.struct_Store
 }
 
-func NewRustStore(path string, sync SyncMode) (*Store, error) {
+// OpenRustStore opens (or creates) a Rust-backed store. Unset fields on
+// cfg take their natural defaults: MaxDataFileSize=0 selects single-file
+// mode, MaxDataFiles=0 selects the Rust-side default.
+func OpenRustStore(cfg StoreConfig) (*Store, error) {
 	pinner := runtime.Pinner{}
 	defer pinner.Unpin()
 
-	pathBytes := []byte(path)
+	pathBytes := []byte(cfg.Path)
 	args := C.struct_StoreArgs{
-		path:       newBorrowedBytes(pathBytes, &pinner),
-		cache_size: C.size_t(64 * 1024 * 1024),
-		truncate:   C._Bool(true),
-		sync:       uint32(sync),
+		path:               newBorrowedBytes(pathBytes, &pinner),
+		cache_size:         C.size_t(64 * 1024 * 1024),
+		max_data_file_size: C.uint64_t(cfg.MaxDataFileSize),
+		max_data_files:     C.size_t(cfg.MaxDataFiles),
+		truncate:           C._Bool(cfg.Truncate),
+		sync:               uint32(cfg.Sync),
 	}
 
 	return getStoreFromHandleResult(C.bs_open_store(args))
+}
+
+// NewRustStore is a thin shim over OpenRustStore that opens a
+// single-file, truncate-on-open store with the given sync mode.
+// Kept for callers that don't need to set advanced options.
+func NewRustStore(path string, sync SyncMode) (*Store, error) {
+	return OpenRustStore(StoreConfig{
+		Path:     path,
+		Sync:     sync,
+		Truncate: true,
+	})
 }
 
 func (s *Store) WriteBlock(block Block) error {

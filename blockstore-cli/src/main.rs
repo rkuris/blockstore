@@ -105,8 +105,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             target,
             start_block,
         } => {
-            let target_index = target.join("blockdb.idx");
-            let target_data = target.join("blockdb_0.dat");
             let source_store = Store::new(
                 &index_path,
                 &data_path,
@@ -117,8 +115,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             )?;
             let target_min_height = start_block.unwrap_or_else(|| source_store.min_block_height());
             let target_store = Store::new(
-                &target_index,
-                &target_data,
+                &target,
+                &target,
                 NonZeroUsize::new(1024).unwrap(),
                 true,
                 SyncMode::Async,

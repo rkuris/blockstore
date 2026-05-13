@@ -2,6 +2,8 @@ package blockstore
 
 import (
 	"crypto/rand"
+	"fmt"
+	"log"
 	"os"
 	"runtime"
 	"sync"
@@ -42,6 +44,39 @@ func TestSmoke(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, writtenBlocks[uint64(i)], block)
 	}
+}
+
+// ExampleOpenRustStore documents the StoreConfig surface for Go callers.
+// The multi-file algorithm itself is covered by the Rust unit tests; this
+// just shows how to wire up the options.
+func ExampleOpenRustStore() {
+	dir, err := os.MkdirTemp("", "blockstore_example")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	store, err := OpenRustStore(StoreConfig{
+		Path:            dir,
+		Sync:            Sync,
+		Truncate:        true,
+		MaxDataFileSize: 1 << 30, // 1 GiB per blockdb_N.dat (0 = unlimited)
+		MaxDataFiles:    16,      // open-fd cache size (0 = default)
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := store.WriteBlock(Block{Height: 1, Data: []byte("hello")}); err != nil {
+		log.Fatal(err)
+	}
+	block, err := store.ReadBlock(1)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(string(block))
+	// Output: hello
 }
 
 func TestParallel(t *testing.T) {

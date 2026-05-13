@@ -150,6 +150,18 @@ typedef struct StoreArgs {
    */
   size_t cache_size;
   /**
+   * Maximum size of a single data file in bytes. `0` means unlimited
+   * (single-file mode); any other value caps each `blockdb_N.dat` file
+   * at that many bytes and rolls into the next file when a block would
+   * cross the boundary.
+   */
+  uint64_t max_data_file_size;
+  /**
+   * Maximum number of open data-file handles to keep cached. `0` means
+   * use the default ([`DEFAULT_MAX_DATA_FILES`]).
+   */
+  size_t max_data_files;
+  /**
    * If true, the store is truncated when opened.
    */
   bool truncate;

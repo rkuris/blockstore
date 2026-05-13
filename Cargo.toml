@@ -22,6 +22,7 @@ more-asserts = "0.3.1"
 criterion = { version = "0.5.1", features = ["html_reports"] }
 pprof = { version = "0.15.0", features = ["flamegraph", "criterion"] }
 cbindgen = "0.29.0"
+strum = { version = "0.27", features = ["derive"] }
 
 [workspace.lints.clippy]
 pedantic = "warn"
