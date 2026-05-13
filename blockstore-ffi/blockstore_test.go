@@ -29,7 +29,7 @@ func TestSmoke(t *testing.T) {
 		err = store.WriteBlock(Block{
 			Height: uint64(i),
 			Data:   data,
-		}, 0)
+		})
 		require.NoError(t, err)
 		writtenBlocks[uint64(i)] = data
 
@@ -63,7 +63,7 @@ func TestParallel(t *testing.T) {
 		go func() {
 			for j := 0; j < 1024; j++ {
 				h := height.Add(1)
-				err := store.WriteBlock(Block{Height: h, Data: data}, 0)
+				err := store.WriteBlock(Block{Height: h, Data: data})
 				require.NoError(t, err)
 			}
 			wg.Done()
@@ -85,7 +85,7 @@ func BenchmarkReadBlock(b *testing.B) {
 	}
 
 	var height atomic.Uint64
-	err = store.WriteBlock(Block{Height: height.Add(1), Data: data}, 0)
+	err = store.WriteBlock(Block{Height: height.Add(1), Data: data})
 	require.NoError(b, err)
 
 	b.ResetTimer()
@@ -124,7 +124,7 @@ func benchWrite(b *testing.B, syncMode SyncMode) {
 		for j := 0; j < nthreads; j++ {
 			go func() {
 				defer wg.Done()
-				err := store.WriteBlock(Block{Height: height.Add(1), Data: data}, 0)
+				err := store.WriteBlock(Block{Height: height.Add(1), Data: data})
 				require.NoError(b, err)
 			}()
 		}

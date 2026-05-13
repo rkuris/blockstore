@@ -7,8 +7,6 @@ package blockstore
 // #cgo nocallback bs_write_block
 // #cgo noescape bs_read_block
 // #cgo nocallback bs_read_block
-// #cgo noescape bs_read_block_header
-// #cgo nocallback bs_read_block_header
 // #cgo noescape bs_max_contiguous_height
 // #cgo nocallback bs_max_contiguous_height
 import "C"
@@ -36,22 +34,18 @@ func NewRustStore(path string, sync SyncMode) (*Store, error) {
 	return getStoreFromHandleResult(C.bs_open_store(args))
 }
 
-func (s *Store) WriteBlock(block Block, headerSize uint16) error {
+func (s *Store) WriteBlock(block Block) error {
 	pinner := runtime.Pinner{}
 	defer pinner.Unpin()
 
 	data := newBorrowedBytes(block.Data, &pinner)
 	return getErrorFromVoidResult(
-		C.bs_write_block(s.handle, C.uint64_t(block.Height), data, C.uint16_t(headerSize)),
+		C.bs_write_block(s.handle, C.uint64_t(block.Height), data),
 	)
 }
 
 func (s *Store) ReadBlock(height uint64) ([]byte, error) {
 	return getBytesFromBlockResult(C.bs_read_block(s.handle, C.uint64_t(height)))
-}
-
-func (s *Store) ReadBlockHeader(height uint64) ([]byte, error) {
-	return getBytesFromBlockResult(C.bs_read_block_header(s.handle, C.uint64_t(height)))
 }
 
 func (s *Store) MaxContiguousHeight() uint64 {

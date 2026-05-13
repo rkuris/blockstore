@@ -108,10 +108,9 @@ pub extern "C" fn bs_write_block(
     store: Option<&Store>,
     height: BlockHeight,
     data: BorrowedBytes<'_>,
-    header_size: u16,
 ) -> VoidResult {
     invoke_with_handle(store, move |store| {
-        store.write_block(height, data.as_slice(), header_size)
+        store.write_block(height, data.as_slice())
     })
 }
 
@@ -128,14 +127,6 @@ pub extern "C" fn bs_write_block(
 #[unsafe(no_mangle)]
 pub extern "C" fn bs_read_block(store: Option<&Store>, height: BlockHeight) -> BlockResult {
     invoke_with_handle(store, move |store| store.read_block(height))
-}
-
-/// Reads the block header at `height` from the store.
-///
-/// See [`bs_read_block`] for the return semantics.
-#[unsafe(no_mangle)]
-pub extern "C" fn bs_read_block_header(store: Option<&Store>, height: BlockHeight) -> BlockResult {
-    invoke_with_handle(store, move |store| store.read_block_header(height))
 }
 
 /// Returns the maximum contiguous block height of the store, or 0 if `store`

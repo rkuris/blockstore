@@ -126,7 +126,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             )?;
             let mut height = start_block.unwrap_or(target_min_height);
             while let Some(block) = source_store.read_block(height)? {
-                target_store.write_block(height, &block, 0)?;
+                target_store.write_block(height, &block)?;
                 height = height.checked_add(1).ok_or("Overflow")?;
             }
             println!("Copied blocks up to height {}", height.saturating_sub(1));

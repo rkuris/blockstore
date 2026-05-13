@@ -422,12 +422,7 @@ impl Store {
     ///
     /// # Panics
     /// Panics if the cache lock has been poisoned.
-    pub fn write_block(
-        &self,
-        height: BlockHeight,
-        block: &[u8],
-        _header_size: u16,
-    ) -> Result<(), Error> {
+    pub fn write_block(&self, height: BlockHeight, block: &[u8]) -> Result<(), Error> {
         #[cfg(feature = "metrics")]
         let start = coarsetime::Instant::now();
 
@@ -738,19 +733,6 @@ impl Store {
     pub fn min_block_height(&self) -> BlockHeight {
         self.header.min_height
     }
-
-    /// The Go-compatible format does not store a separate per-block header size,
-    /// so extracting a logical "block header" slice is not supported.
-    ///
-    /// # Errors
-    /// Always returns `ErrorKind::Unsupported`.
-    pub fn read_block_header(&self, height: BlockHeight) -> Result<Option<Block>, Error> {
-        let _ = height;
-        Err(Error::new(
-            ErrorKind::Unsupported,
-            "read_block_header is not supported by Go-compatible on-disk format",
-        ))
-    }
 }
 
 impl Drop for Store {
@@ -806,7 +788,7 @@ mod tests {
         )
         .unwrap();
         let block = vec![32; 1024];
-        store.write_block(1, &block, 0).unwrap();
+        store.write_block(1, &block).unwrap();
         let block_read = store.read_block(1).unwrap().unwrap();
         assert_eq!(block.into_boxed_slice(), block_read);
 
@@ -837,7 +819,7 @@ mod tests {
                     s.spawn(|| {
                         for _ in 0..100 {
                             let i = height.fetch_add(1, Ordering::Relaxed);
-                            store.write_block(i, &data, 0).unwrap();
+                            store.write_block(i, &data).unwrap();
                         }
                     })
                 })
@@ -865,7 +847,7 @@ mod tests {
             1,
         )
         .unwrap();
-        store.write_block(1, &vec![32; 1024], 0).unwrap();
+        store.write_block(1, &vec![32; 1024]).unwrap();
         assert_eq!(1, store.max_contiguous_height());
 
         // simulate a crash
@@ -919,7 +901,7 @@ mod tests {
         )
         .unwrap();
 
-        store.write_block(1, &[1, 2, 3, 4], 0).unwrap();
+        store.write_block(1, &[1, 2, 3, 4]).unwrap();
 
         assert!(tmpdir.path().join(Store::INDEX_FILE_NAME).exists());
         assert!(tmpdir.path().join(Store::DATA_FILE_NAME).exists());
@@ -941,8 +923,8 @@ mod tests {
         )
         .unwrap();
 
-        store.write_block(0, &first, 0).unwrap();
-        store.write_block(1, &second, 0).unwrap();
+        store.write_block(0, &first).unwrap();
+        store.write_block(1, &second).unwrap();
 
         assert_eq!(
             Some(first.clone().into_boxed_slice()),

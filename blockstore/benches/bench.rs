@@ -24,7 +24,7 @@ fn bench_write_block_sync(c: &mut Criterion) {
         b.iter(|| {
             for _ in 0..256 {
                 store
-                    .write_block(black_box(block_height), black_box(&block), 0)
+                    .write_block(black_box(block_height), black_box(&block))
                     .unwrap();
                 block_height += 1;
             }
@@ -44,7 +44,7 @@ fn bench_read_block(c: &mut Criterion) {
     )
     .unwrap();
     let block = vec![32; 1024];
-    store.write_block(1, &block, 0).unwrap();
+    store.write_block(1, &block).unwrap();
 
     c.bench_function("read_async", |b| {
         b.iter(|| {
@@ -92,7 +92,7 @@ fn bench_write_block_parallel<const MODE: u8>(c: &mut Criterion) {
                         for _ in 0..iters / threads as u64 {
                             let height = height.fetch_add(1, Ordering::Relaxed);
                             store
-                                .write_block(height, &block, 0)
+                                .write_block(height, &block)
                                 .unwrap_or_else(|_| panic!("Block height {height}"));
                         }
                     });

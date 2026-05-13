@@ -223,7 +223,7 @@ pub fn import(
                 receipts_value.as_ref(),
             ]);
             let block: Block = combined.as_ref().into();
-            store.write_block(body_key.height().unwrap(), &block, 0)?;
+            store.write_block(body_key.height().unwrap(), &block)?;
             count = count.checked_add(1).ok_or("Overflow")?;
             if count.is_multiple_of(100_000) {
                 println!("Imported {count} blocks");
@@ -243,7 +243,7 @@ pub fn import(
             let combined =
                 rlp::encode_list::<&[u8], &[u8]>(&[header_value.as_ref(), body_value.as_ref()]);
             let block: Block = combined.as_ref().into();
-            store.write_block(body_key.height().unwrap(), &block, 0)?;
+            store.write_block(body_key.height().unwrap(), &block)?;
             count = count.checked_add(1).ok_or("Overflow")?;
             if count.is_multiple_of(100_000) {
                 println!("Imported {count} blocks");

@@ -254,13 +254,6 @@ struct StoreHandleResult bs_open_store(struct StoreArgs args);
 struct BlockResult bs_read_block(const struct Store *store, BlockHeight height);
 
 /**
- * Reads the block header at `height` from the store.
- *
- * See [`bs_read_block`] for the return semantics.
- */
-struct BlockResult bs_read_block_header(const struct Store *store, BlockHeight height);
-
-/**
  * Writes a block at `height` to the store.
  *
  * # Returns
@@ -270,7 +263,4 @@ struct BlockResult bs_read_block_header(const struct Store *store, BlockHeight h
  * - [`VoidResult::Err`] with a UTF-8 message otherwise. The caller must call
  *   [`bs_free_owned_bytes`] on the message.
  */
-struct VoidResult bs_write_block(const struct Store *store,
-                                 BlockHeight height,
-                                 BorrowedBytes data,
-                                 uint16_t header_size);
+struct VoidResult bs_write_block(const struct Store *store, BlockHeight height, BorrowedBytes data);
