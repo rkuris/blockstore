@@ -95,6 +95,49 @@ silently refused. The pattern (single counter name, structured
 labels) follows firewood — cheaper at query time than parallel
 hit/miss counter names, and easier to chart in Grafana/Prometheus.
 
+### Command-line tool (`blockstore-cli`)
+
+**blockdb:** is a library only — no `main.go`, no `cmd/` directory,
+no binary. Inspecting a store on disk, importing from another
+backend, or copying blocks between stores all require writing a
+one-off Go program that links the package and uses its public API.
+
+**Rust:** ships `blockstore-cli` as a workspace crate with three
+subcommands:
+
+| Subcommand | What it does |
+|---|---|
+| `get --height N` | Read and hex-dump the block at height N. |
+| `import --leveldb DB` | Import blocks from a LevelDB database (the historical avalanchego format) into a fresh blockstore. |
+| `copy --target DIR` | Copy/migrate blocks from one blockstore directory to another. |
+
+**Why it's useful (maintenance angle):**
+
+Every CLI subcommand replaces an ad-hoc Go program that blockdb
+operators would otherwise have to write each time. Concretely:
+
+- **Post-incident forensics.** When a node misbehaves and you suspect
+  the block store, "what's actually at height N?" is one CLI
+  invocation, no avalanchego binary or Go toolchain required. With
+  blockdb you'd write `main.go`, `go run` it, and probably re-write
+  it next time because you didn't commit it anywhere.
+- **Migration and format work.** `copy` and `import` exercise the
+  full open → read → write → recovery pipeline against real data,
+  which doubles as integration testing for the library itself. Any
+  format change immediately shows up if `copy` round-trips fail.
+- **Reproducing bugs.** When a user reports a corrupted store, you
+  can `get` specific heights and inspect the raw bytes without
+  setting up a node. The CLI accepts the same paths the FFI does, so
+  there's no behavioral skew between "what the CLI sees" and "what
+  avalanchego sees".
+- **No version drift.** The CLI lives in the same workspace as the
+  library, builds in the same CI, and tracks the same `Store` API.
+  An out-of-tree debug script in Go drifts the moment the library
+  changes signature.
+
+The CLI is small (~150 lines of `clap` glue + one import module) and
+the maintenance cost is dwarfed by the saved one-off scripting.
+
 ### `max_contiguous_height` — incremental contiguity tracking
 
 **blockdb:** tracks `maxBlockHeight` (`database.go:189`) — the highest
@@ -226,6 +269,56 @@ forget.
 **Why it's better:** A category of bug ("forgot to call Close()") is
 removed. Recovery still works if `Drop` is skipped via `mem::forget`
 or process crash — but the common-case shutdown path is automatic.
+
+---
+
+## Constraints
+
+Honest list of places where the Rust port is *less capable* than
+blockdb. These are tradeoffs we made deliberately — usually in
+exchange for one of the wins above — not oversights.
+
+### Little-endian only
+
+**blockdb:** uses `binary.LittleEndian.PutUint64` / `Uint64`
+throughout (`database.go:148-164` etc.). The serialisation is
+portable: a blockdb store written on a big-endian host is readable
+on a little-endian host and vice versa.
+
+**Rust:** `IndexFileHeader` and `IndexEntry` are serialised
+zero-copy via `bytemuck::bytes_of` — the on-disk bytes are the
+in-memory representation, which is **host-endian**. On every
+target Rust ships with by default (x86_64, aarch64, RISC-V LE, WASM)
+that's little-endian and matches blockdb. On a big-endian target
+(`powerpc-unknown-linux-gnu`, `s390x-unknown-linux-gnu`, MIPS BE)
+the on-disk bytes would be reversed and incompatible with blockdb.
+
+`BlockHeader` itself is serialised with explicit `to_le_bytes` /
+`from_le_bytes` and is portable, but the index structures are not.
+
+We defend this with a compile-time guard in `blockstore/src/lib.rs`:
+
+```rust
+#[cfg(not(target_endian = "little"))]
+compile_error!("blockstore requires a little-endian target: ...");
+```
+
+A BE build fails loudly instead of silently producing files that
+neither blockdb nor a future LE Rust build could read.
+
+**Why we accept this:** zero-copy serialisation buys us
+compiler-verified layout (a Pod-derive failure is a compile error)
+and zero-allocation read/write of the index header — both real wins
+on the LE platforms we actually ship to. Every realistic deployment
+target (x86_64 servers, ARM64 macOS / Linux, ARM64 cloud) is LE; no
+Avalanche operator is running a node on a System Z mainframe or
+PowerPC 64BE. The cost of the constraint is theoretical.
+
+If a BE target ever became load-bearing, the fix is mechanical:
+switch the index structures to the same `to_le_bytes` /
+`from_le_bytes` style `BlockHeader` already uses. We'd lose the
+zero-copy path; we'd keep the compatibility. We'd take that trade if
+we had to — we just don't have to today.
 
 ---
 
