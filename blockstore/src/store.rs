@@ -913,6 +913,15 @@ impl Store {
         self.max_contiguous_height.load(Ordering::Relaxed)
     }
 
+    /// Highest block height ever written to this store, regardless of
+    /// contiguity. Diverges from [`Self::max_contiguous_height`] whenever
+    /// blocks are written with gaps below them: contiguous tracking stalls at
+    /// the floor of the first gap, while the highwater advances on every
+    /// successful write.
+    pub fn height_highwater(&self) -> BlockHeight {
+        self.height_highwater.load(Ordering::Relaxed)
+    }
+
     pub fn min_block_height(&self) -> BlockHeight {
         self.header.min_height
     }
@@ -977,6 +986,35 @@ mod tests {
 
         // check the maximum contiguous height
         assert_eq!(1, store.max_contiguous_height());
+    }
+
+    #[test]
+    fn height_highwater_diverges_with_gaps() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let store = Store::new(
+            tmpdir.path(),
+            tmpdir.path(),
+            NonZeroUsize::new(1024).unwrap(),
+            true,
+            SyncMode::Async,
+            1,
+        )
+        .unwrap();
+        let block = vec![7u8; 64];
+
+        store.write_block(1, &block).unwrap();
+        assert_eq!(1, store.max_contiguous_height());
+        assert_eq!(1, store.height_highwater());
+
+        // Skip height 2, write 3: highwater advances, contiguous does not.
+        store.write_block(3, &block).unwrap();
+        assert_eq!(1, store.max_contiguous_height());
+        assert_eq!(3, store.height_highwater());
+
+        // Fill the gap: contiguous catches up to the highwater.
+        store.write_block(2, &block).unwrap();
+        assert_eq!(3, store.max_contiguous_height());
+        assert_eq!(3, store.height_highwater());
     }
 
     #[test]
