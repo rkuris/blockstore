@@ -254,6 +254,40 @@ boundary.
 "unlimited" branch is forced into the type system, not lurking behind
 a runtime value comparison.
 
+### Advisory locking on `Store::open`
+
+**blockdb:** the Go implementation takes no advisory lock when opening a
+store directory. Two processes that point at the same directory both
+succeed, and both proceed to write — interleaving updates to the index
+header, data files, and next-write-offset. The on-disk layout silently
+diverges from any consistent state. There is no in-process or
+cross-process guard against this; consumers are expected to coordinate
+externally (typically by relying on the surrounding service being a
+singleton).
+
+**Rust:** `Store::open` takes an exclusive advisory lock
+(`File::try_lock`, stable stdlib since 1.89) on the index file and holds
+it for the `Store`'s lifetime. A second open against the same directory
+fails fast with `io::ErrorKind::WouldBlock` instead of corrupting data.
+Every R/W-opened data file likewise takes an advisory lock when added
+to the `FileSet`; the lock is released when the file handle's last
+`Arc<File>` clone drops.
+
+**Why it's better:** an entire class of corruption — "I accidentally
+ran two writers against the same store" — becomes a clean, immediate
+error at open time instead of slow, silent damage that only surfaces
+on the next reopen. The mechanism is OS-native (`flock` on Unix,
+`LockFileEx` on Windows via stdlib), advisory (no impact on processes
+that don't open via `Store::open`), and costs one syscall at open and
+one at drop.
+
+**Known limitation:** the data-file lock travels with the cached
+`Arc<File>`. If a sealed data file is evicted from the `FileSet`'s LRU
+cache, its lock is briefly released until the file is re-opened. The
+active (most-recently-touched) data file is always MRU so it doesn't
+get evicted in practice, but tightening this gap by pinning the active
+file in a dedicated slot is tracked as future work.
+
 ### Automatic cleanup via `Drop`
 
 **blockdb:** `Close()` must be called explicitly. Forgetting to call

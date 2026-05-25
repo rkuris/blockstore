@@ -180,14 +180,35 @@ impl FileSet {
     /// least-recently-used handle is evicted (closed when its last `Arc`
     /// reference drops).
     ///
-    /// On a cache miss the file is opened without holding any lock. If
-    /// another thread inserts a handle for the same index first, this
-    /// thread's freshly-opened handle is discarded and the cached one is
-    /// returned — wasting one `open(2)` syscall but keeping the cache
-    /// invariant that every index maps to exactly one handle.
+    /// On a cache miss the file is opened R/W and an advisory exclusive
+    /// lock is acquired. The lock is released when the underlying `File`
+    /// is dropped — i.e., when both the cache slot and every outstanding
+    /// `Arc<File>` clone go away.
+    ///
+    /// Paired with `Store::open`'s index-file lock, this prevents two
+    /// processes from corrupting a store via interleaved writes. The
+    /// cache's LRU eviction can momentarily release a sealed data file's
+    /// lock if it ages out and is re-opened later — that's a small race
+    /// window we accept (the active data file is always MRU, so it
+    /// doesn't get evicted in practice). Closing the gap would require
+    /// pinning the active file in a dedicated slot; left as future work.
+    ///
+    /// The open+lock is performed under the cache mutex so concurrent
+    /// callers racing on the same cold index don't both open the file
+    /// (which would have the second one fail to acquire the lock and
+    /// return a spurious error). Once cached, subsequent calls take the
+    /// fast `lookup` path with no mutex contention beyond the LRU touch.
     pub(crate) fn get_or_open(&self, index: u32) -> Result<Arc<File>, Error> {
         if let Some(handle) = self.lookup(index) {
             return Ok(handle);
+        }
+
+        let mut inner = self.inner.lock();
+        // Double-check inside the mutex — another thread may have inserted
+        // between our `lookup` miss and acquiring this lock.
+        if let Some(existing) = inner.handles.get(&index).cloned() {
+            inner.touch(index);
+            return Ok(existing);
         }
 
         let path = self.path_for(index);
@@ -197,13 +218,16 @@ impl FileSet {
             .create(true)
             .truncate(false)
             .open(&path)?;
+        file.try_lock().map_err(|e| {
+            Error::new(
+                ErrorKind::WouldBlock,
+                format!(
+                    "unable to acquire advisory lock on {}: data file may be open in another process ({e})",
+                    path.display(),
+                ),
+            )
+        })?;
         let new_handle = Arc::new(file);
-
-        let mut inner = self.inner.lock();
-        if let Some(existing) = inner.handles.get(&index).cloned() {
-            inner.touch(index);
-            return Ok(existing);
-        }
         inner.insert(index, Arc::clone(&new_handle));
         Ok(new_handle)
     }
@@ -358,8 +382,14 @@ mod tests {
 
         let a = fs.get_or_open(0).unwrap();
         fs.evict(0);
+        // Drop the outstanding handle so the underlying File closes and
+        // its advisory lock is released. Without this, the re-open below
+        // would fail with WouldBlock — same-process flock semantics treat
+        // separate fds as distinct lock holders.
+        drop(a);
         let a2 = fs.get_or_open(0).unwrap();
-        // Evicted then re-opened: not the same Arc.
-        assert!(!Arc::ptr_eq(&a, &a2));
+        // Re-open after eviction produced a usable handle (with its own
+        // fresh lock).
+        drop(a2);
     }
 }

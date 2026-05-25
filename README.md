@@ -62,6 +62,10 @@ durability — is at parity by design.
    - Byte-budgeted block cache via `lru-mem` — operators size by
      memory budget, not entry count, so block-size variance can't
      blow up RAM usage.
+   - Advisory locking on `Store::open` — a second open against the
+     same directory fails fast with `WouldBlock` instead of silently
+     corrupting on-disk state via interleaved writes. blockdb has
+     no such guard; safety is left to external coordination.
 
 5. **Type-system enforcement.** A handful of bug-classes that
    blockdb has to remember to avoid are structurally impossible

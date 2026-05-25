@@ -11,6 +11,8 @@ use std::mem;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytemuck::{Pod, Zeroable};
@@ -78,6 +80,12 @@ pub struct Store {
     sync: SyncMode,
     max_contiguous_height: AtomicU64,
     height_highwater: AtomicU64,
+    /// When set, `Drop` skips the final checkpoint and lets files close
+    /// normally. Used by tests to simulate an unclean shutdown without
+    /// leaking handles (which would also retain advisory locks). See
+    /// `simulate_crash` in this file's tests.
+    #[cfg(test)]
+    crashed: AtomicBool,
 }
 
 /// The size of a block in the store.
@@ -316,7 +324,28 @@ impl Store {
             .truncate(options.truncate)
             .write(true)
             .read(true);
-        let mut index_file = opts.open(index_filename)?;
+        let mut index_file = opts.open(&index_filename)?;
+
+        // Advisory lock the index file for the lifetime of the Store. This
+        // prevents two processes from opening the same store directory
+        // concurrently — without it, both processes would happily interleave
+        // writes to the index header and data files, silently corrupting
+        // layout invariants (next_write_offset, contiguity, etc.). The lock
+        // is released when `index_file` is dropped (i.e., when the Store is
+        // dropped or the process exits).
+        //
+        // Same-process opens are also rejected, which is by design: if a
+        // caller wants two handles to the same store within one process they
+        // should share a `Store` via `Arc`, not open twice.
+        index_file.try_lock().map_err(|e| {
+            Error::new(
+                ErrorKind::WouldBlock,
+                format!(
+                    "unable to acquire advisory lock on {}: store may be open in another process ({e})",
+                    index_filename.display(),
+                ),
+            )
+        })?;
 
         // On truncate, also remove any pre-existing blockdb_N.dat files
         // from the data directory. Otherwise old data would haunt a "fresh"
@@ -363,6 +392,8 @@ impl Store {
             sync: options.sync,
             max_contiguous_height: AtomicU64::new(options.minimum_height.saturating_sub(1)),
             height_highwater: AtomicU64::new(options.minimum_height.saturating_sub(1)),
+            #[cfg(test)]
+            crashed: AtomicBool::default(),
         };
         if !options.truncate {
             result.recover()?;
@@ -929,6 +960,14 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if self.crashed.load(Ordering::Relaxed) {
+            // Simulated crash: skip the final checkpoint so the next open
+            // exercises the recovery path. Files still close normally,
+            // releasing OS advisory locks — that's the whole point of
+            // using this over `mem::forget`.
+            return;
+        }
         if self.sync == SyncMode::Sync {
             self.index_file.sync_all().unwrap();
         }
@@ -940,10 +979,72 @@ impl Drop for Store {
 #[cfg(test)]
 mod tests {
     use std::mem;
-    use std::mem::forget;
     use std::thread::{available_parallelism, scope};
 
     use super::*;
+
+    /// Simulate an unclean shutdown: skip the checkpoint but still run
+    /// `Drop` so files close and advisory locks are released. Unlike
+    /// `mem::forget(store)`, which would keep the locks held and block
+    /// the next `Store::open` in this test.
+    fn simulate_crash(store: Store) {
+        store.crashed.store(true, Ordering::Relaxed);
+        drop(store);
+    }
+
+    #[test]
+    fn second_open_of_same_dir_is_rejected() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let _first = Store::open(
+            tmpdir.path(),
+            tmpdir.path(),
+            StoreOptions {
+                truncate: true,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+
+        // Second open against the same directory must fail because the
+        // index file is held with an exclusive advisory lock.
+        let err = Store::open(
+            tmpdir.path(),
+            tmpdir.path(),
+            StoreOptions {
+                truncate: false,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(ErrorKind::WouldBlock, err.kind(), "got: {err}");
+    }
+
+    #[test]
+    fn lock_released_after_drop() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let first = Store::open(
+            tmpdir.path(),
+            tmpdir.path(),
+            StoreOptions {
+                truncate: true,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+        drop(first);
+
+        // After a clean drop the index-file lock is released, so a
+        // subsequent open succeeds.
+        let _second = Store::open(
+            tmpdir.path(),
+            tmpdir.path(),
+            StoreOptions {
+                truncate: false,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+    }
 
     #[test]
     fn header_size_test() {
@@ -1072,7 +1173,7 @@ mod tests {
         assert_eq!(1, store.max_contiguous_height());
 
         // simulate a crash
-        forget(store);
+        simulate_crash(store);
 
         // recover the store
         let store = Store::new(
@@ -1091,7 +1192,7 @@ mod tests {
         store.checkpoint(*store.data_highwater.lock()).unwrap();
 
         // simulate a crash
-        forget(store);
+        simulate_crash(store);
 
         // recover the store
         let store = Store::new(
@@ -1149,7 +1250,7 @@ mod tests {
         assert_eq!(Some(second.clone().into()), store.read_block(1).unwrap());
         assert_eq!(1, store.max_contiguous_height());
 
-        forget(store);
+        simulate_crash(store);
 
         let recovered = Store::new(
             tmpdir.path(),
@@ -1296,7 +1397,7 @@ mod tests {
             let store = open_with_cap(tmpdir.path(), cap, true, 1).unwrap();
             store.write_block(1, &block_a).unwrap();
             store.write_block(2, &block_b).unwrap();
-            forget(store); // skip Drop's checkpoint, simulating crash
+            simulate_crash(store);
         }
 
         // Both files should exist.
@@ -1313,8 +1414,8 @@ mod tests {
     // ---- recovery / corruption-detection tests -------------------------
     //
     // Ported from blockdb's `TestRecovery_CorruptionDetection`. Each test
-    // writes blocks, simulates a crash via `forget(store)` (so the index
-    // header stays stale and recovery does a fresh scan), corrupts a byte
+    // writes blocks, simulates a crash via `simulate_crash(store)` (so the
+    // index header stays stale and recovery does a fresh scan), corrupts a byte
     // on disk, and asserts that the corrupted block (and all that follow)
     // are not picked up by recovery.
 
@@ -1362,7 +1463,7 @@ mod tests {
                 .write_block(h, &incompressible(h, block_size))
                 .unwrap();
         }
-        forget(store);
+        simulate_crash(store);
     }
 
     fn reopen(dir: &Path) -> Result<Store, Error> {
@@ -1482,7 +1583,7 @@ mod tests {
         for h in 5..=8 {
             store.write_block(h, &incompressible(h, 256)).unwrap();
         }
-        forget(store);
+        simulate_crash(store);
 
         let block_1_compressed = read_block_size_field(dir.path(), 0);
         let block_2_offset = u64::from(block_1_compressed) + BlockHeader::SERIALIZED_SIZE as u64;
