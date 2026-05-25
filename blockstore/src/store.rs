@@ -437,8 +437,12 @@ impl Store {
             ));
         }
 
-        self.max_contiguous_height
-            .store(self.header.max_height, Ordering::Relaxed);
+        // `header.max_height` is the persisted highwater, NOT the contiguity
+        // floor. Seed `height_highwater` from it. The true
+        // `max_contiguous_height` is recomputed below by scanning the index
+        // for the first zeroed entry, since gaps below the highwater may
+        // have existed before the crash (e.g. out-of-order writes during
+        // bootstrap).
         self.height_highwater
             .store(self.header.max_height, Ordering::Relaxed);
 
@@ -446,8 +450,88 @@ impl Store {
             self.recover_unindexed_blocks(calculated_next_write_offset, &data_files)?;
         }
 
+        let contiguous_floor = self.scan_contiguous_floor()?;
+        self.max_contiguous_height
+            .store(contiguous_floor, Ordering::Relaxed);
+
         *self.data_highwater.lock() = self.header.next_write_offset;
         Ok(())
+    }
+
+    /// Bulk-scans the index file for the first zeroed (`offset == 0 &&
+    /// size == 0`) entry between `min_height` and `height_highwater` and
+    /// returns the height of the last populated slot before it — i.e. the
+    /// highest contiguous height reachable from `min_height`. Returns
+    /// `min_height - 1` if the very first slot is empty.
+    ///
+    /// This matches the recovery algorithm in the block-store design doc:
+    /// "Once we know the first zeroed offset, we can know the highest
+    /// contiguous height." The scan is bounded by `height_highwater`
+    /// (which only ever rises from validated data — either the persisted
+    /// checkpoint or the data-file scan in `recover_unindexed_blocks`), so
+    /// zombie index entries past a corrupt block do not get counted as
+    /// contiguous. Reads are issued in 64 KiB chunks so the cost is
+    /// dominated by sequential I/O, not per-entry syscalls.
+    fn scan_contiguous_floor(&self) -> Result<BlockHeight, Error> {
+        const ENTRY_SIZE: usize = mem::size_of::<IndexEntry>();
+        const CHUNK_ENTRIES: usize = 4096;
+        const CHUNK_BYTES: usize = CHUNK_ENTRIES * ENTRY_SIZE;
+
+        let header_size = mem::size_of::<IndexFileHeader>() as u64;
+        let min_height = self.header.min_height;
+        let upper_bound = self.height_highwater.load(Ordering::Relaxed);
+        let floor_if_empty = min_height.saturating_sub(1);
+        if upper_bound < min_height {
+            return Ok(floor_if_empty);
+        }
+
+        let overflow = || {
+            Error::new(
+                ErrorKind::InvalidData,
+                "index offset overflow during contiguity scan",
+            )
+        };
+
+        let mut buf = vec![0u8; CHUNK_BYTES];
+        let mut height_cursor = min_height;
+        let mut last_present = floor_if_empty;
+
+        loop {
+            let relative = height_cursor.checked_sub(min_height).ok_or_else(overflow)?;
+            let file_offset = relative
+                .checked_mul(ENTRY_SIZE as u64)
+                .and_then(|o| o.checked_add(header_size))
+                .ok_or_else(overflow)?;
+            let n = self.index_file.read_at(&mut buf, file_offset)?;
+            if n == 0 {
+                return Ok(last_present);
+            }
+            if n % ENTRY_SIZE != 0 {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "index file has trailing partial entry",
+                ));
+            }
+            let entries_read = n / ENTRY_SIZE;
+            let chunk = buf.get(..n).ok_or_else(overflow)?;
+            for (i, entry_bytes) in chunk.chunks_exact(ENTRY_SIZE).enumerate() {
+                let height = height_cursor.checked_add(i as u64).ok_or_else(overflow)?;
+                if height > upper_bound {
+                    return Ok(last_present);
+                }
+                let entry: &IndexEntry = bytemuck::from_bytes(entry_bytes);
+                if entry.offset == 0 && entry.size == 0 {
+                    return Ok(last_present);
+                }
+                last_present = height;
+            }
+            height_cursor = height_cursor
+                .checked_add(entries_read as u64)
+                .ok_or_else(overflow)?;
+            if entries_read < CHUNK_ENTRIES {
+                return Ok(last_present);
+            }
+        }
     }
 
     /// Walks from `self.header.next_write_offset` up to `end_offset`,
@@ -1206,6 +1290,58 @@ mod tests {
         .unwrap();
         assert_eq!(1, store.max_contiguous_height());
         assert_eq!(1, store.height_highwater.load(Ordering::Relaxed));
+    }
+
+    /// Regression test for the bug where `recover()` set
+    /// `max_contiguous_height` to the checkpointed highwater, hiding any
+    /// gap that existed below it before the crash. Reopen must report the
+    /// true contiguity floor, not the highwater.
+    #[test]
+    fn recover_preserves_gap_below_checkpointed_highwater() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let store = Store::new(
+            tmpdir.path(),
+            tmpdir.path(),
+            NonZeroUsize::new(1024).unwrap(),
+            true,
+            SyncMode::Sync,
+            1,
+        )
+        .unwrap();
+
+        let block = vec![42u8; 128];
+        store.write_block(1, &block).unwrap();
+        store.write_block(2, &block).unwrap();
+        // Skip height 3, jump ahead — leaves a gap that contiguity must reflect.
+        store.write_block(4, &block).unwrap();
+        store.write_block(5, &block).unwrap();
+
+        assert_eq!(2, store.max_contiguous_height());
+        assert_eq!(5, store.height_highwater());
+
+        // Force a checkpoint so header.max_height = 5 (the highwater).
+        store.checkpoint(*store.data_highwater.lock()).unwrap();
+        simulate_crash(store);
+
+        let store = Store::new(
+            tmpdir.path(),
+            tmpdir.path(),
+            NonZeroUsize::new(1024).unwrap(),
+            false,
+            SyncMode::Sync,
+            1,
+        )
+        .unwrap();
+        assert_eq!(5, store.height_highwater());
+        assert_eq!(
+            2,
+            store.max_contiguous_height(),
+            "max_contiguous_height must reflect the gap at height 3, not the checkpointed highwater"
+        );
+
+        // Filling the gap should now advance contiguity all the way.
+        store.write_block(3, &block).unwrap();
+        assert_eq!(5, store.max_contiguous_height());
     }
 
     #[test]
