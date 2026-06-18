@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 
 use blockstore::{BlockHeight, Store, SyncMode};
 
+#[cfg(feature = "import")]
 mod import;
 
 #[derive(Parser)]
@@ -28,6 +29,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[cfg(feature = "import")]
     Import {
         /// Path to the `LevelDB` database
         #[arg(short, long)]
@@ -84,6 +86,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let block = store.read_block(height)?.expect("block not found");
             println!("{}", pretty_hex::pretty_hex(&block));
         }
+        #[cfg(feature = "import")]
         Commands::Import {
             leveldb,
             sync,
