@@ -125,7 +125,7 @@ bitflags = false
 
 [parse]
 parse_deps = true
-include = [ "blockstore" ]
+include = [ "blockdb" ]
 # exclude = []
 clean = false
 extra_bindings = []
