@@ -11,7 +11,7 @@ keywords = ["blockchain", "blockstore", "blockchain-storage"]
 categories = ["database-implementations"]
 
 [dependencies]
-blockstore = { path = "../blockstore", version = "0.1.0", package = "blockdb" }
+blockstore = { path = "../blockstore", version = "0.2.0", package = "blockdb" }
 clap = { version = "4.5.39", features = ["derive"] }
 leveldb = { version = "0.8.6" }
 db-key = "0.0.5"
