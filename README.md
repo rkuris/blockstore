@@ -1,5 +1,8 @@
 # blockstore
 
+[![CI](https://github.com/rkuris/blockstore/actions/workflows/ci.yaml/badge.svg)](https://github.com/rkuris/blockstore/actions/workflows/ci.yaml)
+[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?logo=rust&logoColor=white)](https://www.rust-lang.org)
+
 A Rust library (with Go bindings) for storing blockchain blocks
 keyed by height. On-disk-format-compatible with avalanchego's
 [`x/blockdb`](https://github.com/ava-labs/avalanchego/tree/master/x/blockdb),
