@@ -1,5 +1,5 @@
 [package]
-name = "blockstore"
+name = "blockdb"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -9,6 +9,11 @@ description = "A simple blockchain block store in Rust"
 keywords = ["blockchain", "blockstore", "blockchain-storage"]
 categories = ["database-implementations"]
 repository = "https://github.com/rkuris/blockstore"
+
+# Published to crates.io as `blockdb`, but the library is still imported as
+# `blockstore` everywhere (code, dependents, benches/tests) via this lib name.
+[lib]
+name = "blockstore"
 
 [dependencies]
 bytemuck.workspace = true
