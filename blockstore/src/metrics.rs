@@ -5,10 +5,15 @@
 //! the rest of the crate doesn't have to `#[cfg]`-gate every call site.
 //!
 //! Both forms of the underlying `metrics::counter!` are supported —
-//! plain and tagged with `"label" => "value"` pairs. Tagged counters
-//! follow the same convention as firewood (e.g. one counter named
-//! `cache.read` with `type=hit|miss`), which keeps the metric surface
-//! compact at query time.
+//! plain and tagged with `"label" => "value"` pairs. Outcomes are
+//! distinguished by a label rather than baked into the metric name
+//! (e.g. one counter named `cache.read` with `result=hit|miss`, or
+//! `write_block` with `outcome=success|empty|...`), which keeps the
+//! metric surface compact at query time.
+//!
+//! `record_duration!` records latency as a `metrics::histogram!` in
+//! seconds (a float fraction), per Prometheus convention; the metric
+//! name ends in `_seconds`.
 
 // `#[macro_use] mod metrics;` in `lib.rs` exposes these macros to every
 // later sibling module. Both define a `counter!` and `record_duration!`
@@ -39,8 +44,8 @@ macro_rules! counter {
 #[cfg(feature = "metrics")]
 macro_rules! record_duration {
     ($start:expr, $key:expr) => {
-        let duration = coarsetime::Instant::now().duration_since($start);
-        counter!($key).increment(duration.as_millis() as u64);
+        let duration = $start.elapsed();
+        ::metrics::histogram!($key).record(duration.as_secs_f64());
     };
 }
 

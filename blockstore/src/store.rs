@@ -14,6 +14,8 @@ use std::path::Path;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "metrics")]
+use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use parking_lot::Mutex;
@@ -658,16 +660,16 @@ impl Store {
     /// Panics if the cache lock has been poisoned.
     pub fn write_block(&self, height: BlockHeight, block: &[u8]) -> Result<(), Error> {
         #[cfg(feature = "metrics")]
-        let start = coarsetime::Instant::now();
+        let start = Instant::now();
 
         // prohibit writes of zero length blocks
         if block.is_empty() {
-            counter!("blockstore.write_block.empty").increment(1);
+            counter!("blockstore.write_block", "outcome" => "empty").increment(1);
             return Err(Error::new(ErrorKind::InvalidInput, "Block is empty"));
         }
 
         let _: u32 = block.len().try_into().map_err(|_| {
-            counter!("blockstore.write_block.block_too_large").increment(1);
+            counter!("blockstore.write_block", "outcome" => "block_too_large").increment(1);
             Error::new(ErrorKind::InvalidInput, "Block too large")
         })?;
 
@@ -678,7 +680,7 @@ impl Store {
         // check the index file offset for overflows
         // this limits our block height to 2^64 / size_of::<IndexEntry>(), or 2^60 blocks
         let index_entry_offset = self.index_entry_offset(height).ok_or_else(|| {
-            counter!("blockstore.write_block.invalid_block_height").increment(1);
+            counter!("blockstore.write_block", "outcome" => "invalid_block_height").increment(1);
             Error::new(ErrorKind::InvalidInput, "Invalid block height")
         })?;
 
@@ -713,7 +715,7 @@ impl Store {
         data_file
             .write_all_at(&header.serialize(), local_offset)
             .inspect_err(|_| {
-                counter!("blockstore.write_block.write_header_failed").increment(1);
+                counter!("blockstore.write_block", "outcome" => "write_header_failed").increment(1);
             })?;
 
         // write the compressed block data
@@ -726,14 +728,14 @@ impl Store {
                 local_offset.wrapping_add(BlockHeader::SERIALIZED_SIZE as u64),
             )
             .inspect_err(|_| {
-                counter!("blockstore.write_block.write_data_failed").increment(1);
+                counter!("blockstore.write_block", "outcome" => "write_data_failed").increment(1);
             })?;
 
         if self.sync == SyncMode::Sync {
             #[cfg(feature = "metrics")]
-            let sync_start = coarsetime::Instant::now();
+            let sync_start = Instant::now();
             data_file.sync_all()?;
-            record_duration!(sync_start, "blockstore.write_block.sync_duration_ms");
+            record_duration!(sync_start, "blockstore.write_block.sync.duration_seconds");
         }
 
         // update the index file
@@ -763,8 +765,8 @@ impl Store {
             self.checkpoint(saved_offset)?;
         }
 
-        counter!("blockstore.write_block.success").increment(1);
-        record_duration!(start, "blockstore.write_block.success.duration_ms");
+        counter!("blockstore.write_block", "outcome" => "success").increment(1);
+        record_duration!(start, "blockstore.write_block.duration_seconds");
 
         Ok(())
     }
@@ -783,7 +785,7 @@ impl Store {
         if let Some(cap) = max
             && size_with_header > cap
         {
-            counter!("blockstore.write_block.block_exceeds_file_size").increment(1);
+            counter!("blockstore.write_block", "outcome" => "block_exceeds_file_size").increment(1);
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 format!("block size {size_with_header} exceeds max_data_file_size {cap}"),
@@ -799,7 +801,7 @@ impl Store {
                 let offset_within_file = current.checked_rem(cap).expect("cap is non-zero");
                 let end_within_file =
                     offset_within_file.checked_add(size_with_header).ok_or_else(|| {
-                        counter!("blockstore.write_block.block_too_large").increment(1);
+                        counter!("blockstore.write_block", "outcome" => "block_too_large").increment(1);
                         Error::new(
                             ErrorKind::InvalidInput,
                             format!(
@@ -813,21 +815,23 @@ impl Store {
                     // Skip to the start of the next data file.
                     let current_file_idx = current.checked_div(cap).expect("cap is non-zero");
                     let current_file_idx_u32 = u32::try_from(current_file_idx).map_err(|_| {
-                        counter!("blockstore.write_block.offset_overflow").increment(1);
+                        counter!("blockstore.write_block", "outcome" => "offset_overflow")
+                            .increment(1);
                         Error::new(
                             ErrorKind::InvalidInput,
                             format!("file index {current_file_idx} exceeds u32::MAX (cap={cap})"),
                         )
                     })?;
                     advance_to_next_file(current_file_idx_u32, cap).inspect_err(|_| {
-                        counter!("blockstore.write_block.offset_overflow").increment(1);
+                        counter!("blockstore.write_block", "outcome" => "offset_overflow")
+                            .increment(1);
                     })?
                 }
             }
         };
 
         let new_highwater = write_offset.checked_add(size_with_header).ok_or_else(|| {
-            counter!("blockstore.write_block.block_too_large").increment(1);
+            counter!("blockstore.write_block", "outcome" => "block_too_large").increment(1);
             Error::new(
                 ErrorKind::InvalidInput,
                 format!(
@@ -848,7 +852,7 @@ impl Store {
             .max_contiguous_height
             .compare_exchange(prev, height, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| {
-                counter!("blockstore.write_block.out_of_order").increment(1);
+                counter!("blockstore.write_block", "outcome" => "out_of_order").increment(1);
             })
             .map(|mut prev| {
                 // if the current_highwater is higher than the height we just wrote,
@@ -884,7 +888,7 @@ impl Store {
 
     fn update_index(&self, height: BlockHeight, index_entry: IndexEntry) -> Result<(), Error> {
         let offset = self.index_entry_offset(height).ok_or_else(|| {
-            counter!("blockstore.update_index.invalid_block_height").increment(1);
+            counter!("blockstore.update_index", "outcome" => "invalid_block_height").increment(1);
             Error::new(ErrorKind::InvalidInput, "Invalid block height")
         })?;
         self.update_index_at(offset, index_entry)
@@ -938,7 +942,8 @@ impl Store {
 
     fn read_index_entry(&self, height: BlockHeight) -> Result<Option<IndexEntry>, Error> {
         let offset = self.index_entry_offset(height).ok_or_else(|| {
-            counter!("blockstore.read_index_entry.invalid_block_height").increment(1);
+            counter!("blockstore.read_index_entry", "outcome" => "invalid_block_height")
+                .increment(1);
             Error::new(ErrorKind::InvalidInput, "Invalid block height")
         })?;
         let mut index_entry = IndexEntry::default();
@@ -961,10 +966,10 @@ impl Store {
     /// - The file offset somehow overflows
     pub fn read_block(&self, height: BlockHeight) -> Result<Option<Block>, Error> {
         #[cfg(feature = "metrics")]
-        let start = coarsetime::Instant::now();
+        let start = Instant::now();
 
         let entry = self.read_index_entry(height).inspect_err(|_| {
-            counter!("blockstore.read_block.read_index_entry_failed").increment(1);
+            counter!("blockstore.read_block", "outcome" => "read_index_entry_failed").increment(1);
         })?;
         let Some(entry) = entry else {
             return Ok(None);
@@ -972,18 +977,18 @@ impl Store {
 
         let block_size = entry.size;
         if block_size == 0 {
-            counter!("blockstore.read_block.not_found").increment(1);
+            counter!("blockstore.read_block", "outcome" => "not_found").increment(1);
             return Ok(None);
         }
         // TODO: we know the size and can read the whole header and data in one read...
 
         // read the block header
         let blockheader = self.read_block_header_at(entry.offset).inspect_err(|_| {
-            counter!("blockstore.read_block.read_header_failed").increment(1);
+            counter!("blockstore.read_block", "outcome" => "read_header_failed").increment(1);
         })?;
 
         if blockheader.size != block_size {
-            counter!("blockstore.read_block.block_size_mismatch").increment(1);
+            counter!("blockstore.read_block", "outcome" => "block_size_mismatch").increment(1);
             return Err(Error::new(
                 ErrorKind::InvalidData,
                 "block size in index file does not match data",
@@ -995,7 +1000,7 @@ impl Store {
         let block_size: usize = block_size
             .try_into()
             .inspect_err(|_| {
-                counter!("blockstore.read_block.block_size_too_large").increment(1);
+                counter!("blockstore.read_block", "outcome" => "block_size_too_large").increment(1);
             })
             .map_err(|_| Error::new(ErrorKind::InvalidData, "block size too large"))?;
 
@@ -1014,13 +1019,13 @@ impl Store {
         // verify the checksum (checksum is calculated on the original uncompressed data)
         let checksum = xxh64(&block, 0);
         if checksum != blockheader.checksum {
-            counter!("blockstore.read_block.checksum_mismatch").increment(1);
+            counter!("blockstore.read_block", "outcome" => "checksum_mismatch").increment(1);
             return Err(Error::new(ErrorKind::InvalidData, "checksum mismatch"));
         }
 
         let block = Some(block.into());
-        counter!("blockstore.read_block.success").increment(1);
-        record_duration!(start, "blockstore.read_block.success.duration_ms");
+        counter!("blockstore.read_block", "outcome" => "success").increment(1);
+        record_duration!(start, "blockstore.read_block.duration_seconds");
         Ok(block)
     }
 
