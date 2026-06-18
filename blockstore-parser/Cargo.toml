@@ -1,7 +1,7 @@
 [package]
-name = "parser"
+name = "blockstore-parser"
 description = "Parser for Ethereum blocks"
-repository = "https://github.com/ava-labs/blockstore/parser"
+repository = "https://github.com/rkuris/blockstore"
 categories = ["blockchain"]
 keywords = ["blockchain", "ethereum", "parser"]
 version.workspace = true

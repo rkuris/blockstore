@@ -3,7 +3,7 @@ members = [
     "blockstore",
     "blockstore-ffi",
     "blockstore-cli",
-    "parser",
+    "blockstore-parser",
 ]
 resolver = "2"
 
