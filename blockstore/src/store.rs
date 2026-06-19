@@ -116,8 +116,16 @@ pub struct IndexFileHeader {
     pub max_height: u64,
     // The next write offset in the data file.
     pub next_write_offset: u64,
+    // The highest height with no gaps below it (the contiguity floor) as of
+    // the last checkpoint. Persisted so reopen can resume the contiguity scan
+    // from here instead of rescanning the whole index. A value of 0 means
+    // "unknown" — an old on-disk format, or a DB last written by avalanchego
+    // (which leaves these bytes zeroed since it doesn't track contiguity) —
+    // and triggers a full scan. Occupies the first 8 bytes of Go's reserved
+    // area; avalanchego keeps a matching reserved field at this offset.
+    pub highest_contiguous_block_height: u64,
     // Reserved bytes to keep header size equal to Go implementation (64 bytes total).
-    pub reserved: [u8; 24],
+    pub reserved: [u8; 16],
 }
 
 impl IndexFileHeader {
@@ -139,7 +147,8 @@ impl Default for IndexFileHeader {
             min_height: 1,
             max_height: 0,
             next_write_offset: 0,
-            reserved: [0; 24],
+            highest_contiguous_block_height: 0,
+            reserved: [0; 16],
         }
     }
 }
@@ -452,7 +461,15 @@ impl Store {
             self.recover_unindexed_blocks(calculated_next_write_offset, &data_files)?;
         }
 
-        let contiguous_floor = self.scan_contiguous_floor()?;
+        // Resume the contiguity scan from the persisted floor. It is a
+        // monotonic lower bound (heights at or below it were contiguous at
+        // the last checkpoint, and index entries are never cleared), so the
+        // scan need only walk any blocks recovered above it by
+        // `recover_unindexed_blocks`. A persisted 0 means the floor is
+        // unknown (old format / avalanchego-written), and the scan falls back
+        // to walking the whole index from `min_height`.
+        let contiguous_floor =
+            self.scan_contiguous_floor(self.header.highest_contiguous_block_height)?;
         self.max_contiguous_height
             .store(contiguous_floor, Ordering::Relaxed);
 
@@ -461,10 +478,22 @@ impl Store {
     }
 
     /// Bulk-scans the index file for the first zeroed (`offset == 0 &&
-    /// size == 0`) entry between `min_height` and `height_highwater` and
-    /// returns the height of the last populated slot before it — i.e. the
-    /// highest contiguous height reachable from `min_height`. Returns
-    /// `min_height - 1` if the very first slot is empty.
+    /// size == 0`) entry at or above `resume_floor` (bounded above by
+    /// `height_highwater`) and returns the height of the last populated slot
+    /// before it — i.e. the highest contiguous height. Returns
+    /// `min_height - 1` if nothing is present.
+    ///
+    /// `resume_floor` is the persisted contiguity floor (0 if unknown). It is
+    /// a monotonic lower bound: every height at or below it was contiguous at
+    /// the last checkpoint and index entries are never cleared, so the scan
+    /// can start just above it rather than at `min_height`. After a clean
+    /// shutdown (floor == highwater) this returns without reading the index
+    /// at all. A `resume_floor` of 0 — or any value at/below the empty floor,
+    /// `min_height - 1` — collapses to a full scan from `min_height`; that is
+    /// safe because the full scan independently reproduces the correct floor,
+    /// so the only cost of the overloaded 0 is recomputing a floor that is
+    /// already the cheapest possible to recompute (the scan stops at the
+    /// first height).
     ///
     /// This matches the recovery algorithm in the block-store design doc:
     /// "Once we know the first zeroed offset, we can know the highest
@@ -474,7 +503,7 @@ impl Store {
     /// zombie index entries past a corrupt block do not get counted as
     /// contiguous. Reads are issued in 64 KiB chunks so the cost is
     /// dominated by sequential I/O, not per-entry syscalls.
-    fn scan_contiguous_floor(&self) -> Result<BlockHeight, Error> {
+    fn scan_contiguous_floor(&self, resume_floor: BlockHeight) -> Result<BlockHeight, Error> {
         const ENTRY_SIZE: usize = mem::size_of::<IndexEntry>();
         const CHUNK_ENTRIES: usize = 4096;
         const CHUNK_BYTES: usize = CHUNK_ENTRIES * ENTRY_SIZE;
@@ -487,6 +516,15 @@ impl Store {
             return Ok(floor_if_empty);
         }
 
+        // Clamp the resume point into [floor_if_empty, upper_bound]. A value
+        // below `floor_if_empty` (including the unknown sentinel 0) starts the
+        // scan at `min_height`; a value at the highwater short-circuits the
+        // whole scan.
+        let start_floor = resume_floor.max(floor_if_empty).min(upper_bound);
+        if start_floor >= upper_bound {
+            return Ok(start_floor);
+        }
+
         let overflow = || {
             Error::new(
                 ErrorKind::InvalidData,
@@ -495,8 +533,9 @@ impl Store {
         };
 
         let mut buf = vec![0u8; CHUNK_BYTES];
-        let mut height_cursor = min_height;
-        let mut last_present = floor_if_empty;
+        // Every height at or below `start_floor` is already known present.
+        let mut height_cursor = start_floor.checked_add(1).ok_or_else(overflow)?;
+        let mut last_present = start_floor;
 
         loop {
             let relative = height_cursor.checked_sub(min_height).ok_or_else(overflow)?;
@@ -915,6 +954,7 @@ impl Store {
         let mut header = self.header;
         header.next_write_offset = saved_offset;
         header.max_height = self.height_highwater.load(Ordering::Relaxed);
+        header.highest_contiguous_block_height = self.max_contiguous_height.load(Ordering::Relaxed);
         self.index_file
             .write_all_at(bytemuck::bytes_of(&header), 0)?;
         Ok(())
@@ -1347,6 +1387,87 @@ mod tests {
         // Filling the gap should now advance contiguity all the way.
         store.write_block(3, &block).unwrap();
         assert_eq!(5, store.max_contiguous_height());
+    }
+
+    /// The contiguity floor is persisted in the header and restored on
+    /// reopen, so recovery no longer rescans the whole index from
+    /// `min_height` after a clean checkpoint.
+    #[test]
+    fn recover_restores_persisted_contiguous_floor() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let store = Store::new(
+            tmpdir.path(),
+            tmpdir.path(),
+            NonZeroUsize::new(1024).unwrap(),
+            true,
+            SyncMode::Sync,
+            1,
+        )
+        .unwrap();
+
+        let block = vec![7u8; 64];
+        for height in 1..=4 {
+            store.write_block(height, &block).unwrap();
+        }
+        assert_eq!(4, store.max_contiguous_height());
+
+        store.checkpoint(*store.data_highwater.lock()).unwrap();
+        simulate_crash(store);
+
+        let store = Store::new(
+            tmpdir.path(),
+            tmpdir.path(),
+            NonZeroUsize::new(1024).unwrap(),
+            false,
+            SyncMode::Sync,
+            1,
+        )
+        .unwrap();
+        // Floor recovered, and it came from the persisted header field.
+        assert_eq!(4, store.max_contiguous_height());
+        assert_eq!(4, store.header.highest_contiguous_block_height);
+    }
+
+    /// With `min_height == 0` the contiguity floor of a single block at
+    /// height 0 is itself 0 — the same value the header uses to mean
+    /// "unknown". Reopen must still recover correctly: the fallback full
+    /// scan reproduces the floor of 0, and a subsequent in-order write
+    /// advances contiguity.
+    #[test]
+    fn recover_handles_zero_min_height_floor() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let store = Store::new(
+            tmpdir.path(),
+            tmpdir.path(),
+            NonZeroUsize::new(1024).unwrap(),
+            true,
+            SyncMode::Sync,
+            0,
+        )
+        .unwrap();
+
+        let block = vec![9u8; 64];
+        store.write_block(0, &block).unwrap();
+        assert_eq!(0, store.max_contiguous_height());
+
+        store.checkpoint(*store.data_highwater.lock()).unwrap();
+        // Persisted floor is 0, indistinguishable from the "unknown" sentinel.
+        assert_eq!(0, store.header.highest_contiguous_block_height);
+        simulate_crash(store);
+
+        let store = Store::new(
+            tmpdir.path(),
+            tmpdir.path(),
+            NonZeroUsize::new(1024).unwrap(),
+            false,
+            SyncMode::Sync,
+            0,
+        )
+        .unwrap();
+        assert_eq!(0, store.max_contiguous_height());
+
+        store.write_block(1, &block).unwrap();
+        assert_eq!(1, store.max_contiguous_height());
     }
 
     #[test]

@@ -15,7 +15,7 @@ categories = ["database-implementations"]
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-blockstore = { path = "../blockstore", version = "0.2.0", package = "blockdb" }
+blockstore = { path = "../blockstore", version = "0.3.0", package = "blockdb" }
 
 [build-dependencies]
 cbindgen.workspace = true 

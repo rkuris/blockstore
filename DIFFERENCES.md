@@ -150,10 +150,22 @@ candidate or walk by `Get(h)` until it hits `ErrNotFound`.
 **Rust:** `Store::max_contiguous_height()` returns exactly that value
 in O(1). It's maintained incrementally on write via a CAS-based
 fast-path: a write at height `prev + 1` bumps the counter and cascades
-forward through any pre-existing index entries that filled gaps. After
-a crash, recovery rebuilds the counter using `fetch_max` per validated
-block (no cascade, so unverified pre-crash index entries can't poison
-the result).
+forward through any pre-existing index entries that filled gaps.
+
+The floor is persisted at each checkpoint in the index header field
+`highest_contiguous_block_height`, which occupies the first 8 bytes of
+the area blockdb reserves after `next_write_offset` (so the 64-byte
+header size and every preceding field offset are unchanged, and a
+blockdb-written index still parses). On reopen the persisted value seeds
+the counter and the contiguity scan resumes just above it — after a
+clean shutdown this is O(1), with no index reads. A persisted `0` means
+"unknown": an index written by blockdb (which zeroes the reserved area
+and doesn't track contiguity) or by an older revision of this crate. In
+that case recovery falls back to a full index scan from `min_height`,
+bounded by the highwater so unverified pre-crash entries past a corrupt
+block can't poison the result. The scan independently reproduces the
+correct floor, so a database can round-trip blockdb ↔ blockstore and
+only pays the one-time catch-up scan on the next blockstore open.
 
 **Why it's useful:** consensus engines frequently need this exact
 guarantee — "what's the highest height I can hand to a downstream
