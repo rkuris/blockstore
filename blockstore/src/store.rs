@@ -96,6 +96,10 @@ pub struct Store {
     /// floor has not been recomputed — and persisting it would overwrite a
     /// good header with a worse one. `Drop` checkpoints only when this is set.
     recovered: bool,
+    /// Counts index entries actually rewritten during the recovery scan, so
+    /// tests can assert the scan skips entries that already match.
+    #[cfg(test)]
+    recovery_index_writes: AtomicU64,
     /// Counts checkpoints written *during* the recovery scan, so tests can
     /// assert the scan persists progress instead of only doing so at the end.
     #[cfg(test)]
@@ -292,6 +296,88 @@ fn decompress(compressed_data: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(compressed_data.into())
 }
 
+/// A reusable read-ahead window over a single data file.
+///
+/// The recovery scan walks blocks strictly in order, but used to issue two
+/// `pread`s per block — one for the 22-byte header, one for the payload. On
+/// a 2.4M-block store that is 4.2M syscalls, and it measured at ~16 MB/s:
+/// serialized read latency, not device bandwidth or CPU. Refilling a large
+/// window instead makes it roughly one read per [`Self::DEFAULT_BYTES`].
+struct ScanWindow {
+    /// Which data file the window currently holds, if any.
+    file_idx: Option<u32>,
+    /// Offset within that file of `buf[0]`.
+    start: u64,
+    /// Number of valid bytes in `buf`.
+    len: usize,
+    buf: Vec<u8>,
+}
+
+impl ScanWindow {
+    const DEFAULT_BYTES: usize = 1 << 20;
+
+    fn new() -> Self {
+        Self {
+            file_idx: None,
+            start: 0,
+            len: 0,
+            buf: vec![0; Self::DEFAULT_BYTES],
+        }
+    }
+
+    /// Returns the `len` bytes at `local_offset`, refilling from `file` if
+    /// that range isn't already resident.
+    ///
+    /// `file_size` bounds the refill, so a window near EOF is simply
+    /// shorter. A block bigger than the window grows it rather than falling
+    /// back to a direct read — blocks are bounded by `MAX_BLOCK_SIZE` and
+    /// the growth is amortized across the rest of the scan.
+    fn read(
+        &mut self,
+        file: &File,
+        file_idx: u32,
+        local_offset: u64,
+        len: usize,
+        file_size: u64,
+    ) -> Result<&[u8], Error> {
+        let short = || {
+            Error::new(
+                ErrorKind::UnexpectedEof,
+                "recovery: read past end of data file",
+            )
+        };
+        let end = local_offset
+            .checked_add(len as u64)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "recovery: read offset overflow"))?;
+        if end > file_size {
+            return Err(short());
+        }
+
+        let resident = self.file_idx == Some(file_idx)
+            && local_offset >= self.start
+            && end <= self.start.saturating_add(self.len as u64);
+        if !resident {
+            if len > self.buf.len() {
+                self.buf.resize(len, 0);
+            }
+            let want = file_size
+                .saturating_sub(local_offset)
+                .min(self.buf.len() as u64);
+            let want = usize::try_from(want).map_err(|_| short())?;
+            let slot = self.buf.get_mut(..want).ok_or_else(short)?;
+            file.read_exact_at(slot, local_offset)?;
+            self.file_idx = Some(file_idx);
+            self.start = local_offset;
+            self.len = want;
+        }
+
+        let begin =
+            usize::try_from(local_offset.saturating_sub(self.start)).map_err(|_| short())?;
+        let stop = begin.checked_add(len).ok_or_else(short)?;
+        self.buf.get(begin..stop).ok_or_else(short)
+    }
+}
+
 /// Removes any `blockdb_N.dat` files from `dir`. Used when opening a store
 /// with `truncate = true` so a fresh store does not inherit stale data
 /// files from a previous incarnation.
@@ -449,6 +535,8 @@ impl Store {
             recovered: options.truncate,
             #[cfg(test)]
             recovery_checkpoints: AtomicU64::default(),
+            #[cfg(test)]
+            recovery_index_writes: AtomicU64::default(),
             #[cfg(test)]
             crashed: AtomicBool::default(),
         };
@@ -639,6 +727,7 @@ impl Store {
     ) -> Result<(), Error> {
         let cap = self.files.max_data_file_size().map(NonZeroU64::get);
         let mut last_progress = self.header.next_write_offset;
+        let mut window = ScanWindow::new();
 
         loop {
             let scan = self.header.next_write_offset;
@@ -667,7 +756,14 @@ impl Store {
                 }
             }
 
-            let block_header = self.read_block_header_at(scan)?;
+            let data_file = self.files.get_or_open(file_idx)?;
+            let block_header = BlockHeader::deserialize(window.read(
+                &data_file,
+                file_idx,
+                local_offset,
+                BlockHeader::SERIALIZED_SIZE,
+                file_size,
+            )?)?;
             let height = block_header.height;
             let size = block_header.size;
             if height < self.header.min_height
@@ -692,17 +788,18 @@ impl Store {
                 break;
             }
 
-            #[allow(clippy::cast_possible_truncation)]
-            let mut compressed_block = vec![0; size as usize];
-            let data_file = self.files.get_or_open(file_idx)?;
-            data_file.read_at(&mut compressed_block, header_end)?;
+            let payload_len = usize::try_from(size).map_err(|_| {
+                Error::new(ErrorKind::InvalidData, "recovery: block size exceeds usize")
+            })?;
+            let compressed_block =
+                window.read(&data_file, file_idx, header_end, payload_len, file_size)?;
 
             // A payload that doesn't decode means we've reached the end of
             // the valid data — typically a torn write from a crash or ENOSPC
             // that left a complete header ahead of an incomplete payload.
             // Treat it exactly like a checksum mismatch: stop here and let
             // `next_write_offset` overwrite the damage.
-            let Ok(block) = decompress(&compressed_block) else {
+            let Ok(block) = decompress(compressed_block) else {
                 break;
             };
             if xxh64(&block, 0) != block_header.checksum {
@@ -714,7 +811,7 @@ impl Store {
                 size,
                 reserved: [0; 4],
             };
-            self.update_index(height, index_entry)?;
+            self.update_index_if_changed(height, index_entry)?;
             self.update_highwater(height);
             // During recovery we walk strictly forward, so the cascade in
             // `advance_max_contiguous_height` is unneeded and harmful: the
@@ -1057,11 +1154,41 @@ impl Store {
             });
     }
 
-    fn update_index(&self, height: BlockHeight, index_entry: IndexEntry) -> Result<(), Error> {
+    /// Writes an index entry only when the index doesn't already say exactly
+    /// that.
+    ///
+    /// Used by recovery, where the overwhelmingly common case is an unclean
+    /// shutdown in which only the header checkpoint was lost: `write_block`
+    /// already wrote every one of these entries, so each re-derived entry is
+    /// byte-identical to what's on disk. On a 2.4M-block store that was 2.1M
+    /// redundant 16-byte writes. Comparing first turns that whole write
+    /// stream into reads the page cache mostly serves for free.
+    fn update_index_if_changed(
+        &self,
+        height: BlockHeight,
+        index_entry: IndexEntry,
+    ) -> Result<(), Error> {
         let offset = self.index_entry_offset(height).ok_or_else(|| {
             counter!("blockstore.update_index", "outcome" => "invalid_block_height").increment(1);
             Error::new(ErrorKind::InvalidInput, "Invalid block height")
         })?;
+
+        let mut existing = IndexEntry::default();
+        let read = self
+            .index_file
+            .read_at(bytemuck::bytes_of_mut(&mut existing), offset)?;
+        if read == mem::size_of::<IndexEntry>()
+            && existing.offset == index_entry.offset
+            && existing.size == index_entry.size
+            && existing.reserved == index_entry.reserved
+        {
+            counter!("blockstore.recovery_index_entry", "outcome" => "unchanged").increment(1);
+            return Ok(());
+        }
+
+        counter!("blockstore.recovery_index_entry", "outcome" => "written").increment(1);
+        #[cfg(test)]
+        self.recovery_index_writes.fetch_add(1, Ordering::Relaxed);
         self.update_index_at(offset, index_entry)
     }
     fn update_index_at(&self, offset: u64, index_entry: IndexEntry) -> Result<(), Error> {
@@ -2226,6 +2353,109 @@ mod tests {
         file.read_at(bytemuck::bytes_of_mut(&mut header), 0)
             .unwrap();
         header
+    }
+
+    /// Zeroes the index entry for `height`, as if that entry had never been
+    /// written.
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "test helper with known-small offsets"
+    )]
+    fn zero_index_entry(dir: &Path, min_height: u64, height: u64) {
+        let offset = mem::size_of::<IndexFileHeader>() as u64
+            + (height - min_height) * mem::size_of::<IndexEntry>() as u64;
+        let file = OpenOptions::new()
+            .write(true)
+            .open(dir.join(Store::INDEX_FILE_NAME))
+            .unwrap();
+        file.write_all_at(&[0u8; mem::size_of::<IndexEntry>()], offset)
+            .unwrap();
+        file.sync_all().unwrap();
+    }
+
+    /// After an unclean shutdown the index entries are almost always already
+    /// correct — only the header checkpoint was lost. Recovery re-derives
+    /// each entry, so it must compare before writing rather than rewriting
+    /// 2.1M byte-identical entries.
+    #[test]
+    fn recovery_skips_matching_index_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        write_blocks_and_crash(dir.path(), 200, 300);
+
+        let mut header = read_index_header(dir.path());
+        header.next_write_offset = 0;
+        write_index_header(dir.path(), &header);
+
+        let store = reopen(dir.path()).unwrap();
+        assert_eq!(
+            0,
+            store.recovery_index_writes.load(Ordering::Relaxed),
+            "recovery rewrote index entries that already matched",
+        );
+        assert_eq!(200, store.max_contiguous_height());
+        assert_eq!(
+            Some(incompressible(200, 300).into()),
+            store.read_block(200).unwrap()
+        );
+    }
+
+    /// The comparison must not turn into "trust whatever is there": an entry
+    /// that is missing or stale still gets written.
+    #[test]
+    fn recovery_rewrites_stale_index_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        write_blocks_and_crash(dir.path(), 200, 300);
+
+        zero_index_entry(dir.path(), 1, 100);
+        let mut header = read_index_header(dir.path());
+        header.next_write_offset = 0;
+        write_index_header(dir.path(), &header);
+
+        let store = reopen(dir.path()).unwrap();
+        assert_eq!(1, store.recovery_index_writes.load(Ordering::Relaxed));
+        assert_eq!(200, store.max_contiguous_height());
+        assert_eq!(
+            Some(incompressible(100, 300).into()),
+            store.read_block(100).unwrap()
+        );
+    }
+
+    /// A block bigger than the scan window grows the window rather than
+    /// reading short — a short read would silently hand recovery a
+    /// zero-padded payload.
+    #[test]
+    fn recovery_handles_block_larger_than_scan_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = incompressible(7, ScanWindow::DEFAULT_BYTES + 4096);
+        {
+            let store = Store::open(
+                dir.path(),
+                dir.path(),
+                StoreOptions {
+                    truncate: true,
+                    sync: SyncMode::Sync,
+                    minimum_height: 1,
+                    ..StoreOptions::default()
+                },
+            )
+            .unwrap();
+            store.write_block(1, &incompressible(1, 300)).unwrap();
+            store.write_block(2, &big).unwrap();
+            store.write_block(3, &incompressible(3, 300)).unwrap();
+            simulate_crash(store);
+        }
+
+        let mut header = read_index_header(dir.path());
+        header.next_write_offset = 0;
+        write_index_header(dir.path(), &header);
+
+        let store = reopen(dir.path()).unwrap();
+        assert_eq!(3, store.max_contiguous_height());
+        assert_eq!(Some(big.into()), store.read_block(2).unwrap());
+        assert_eq!(
+            Some(incompressible(3, 300).into()),
+            store.read_block(3).unwrap()
+        );
     }
 
     /// Writes the on-disk index header directly, bypassing `Store`.
