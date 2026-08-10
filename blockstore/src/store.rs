@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
+#[cfg(all(feature = "snappy", not(feature = "zstd")))]
+use std::io::Read as _;
 use std::io::{Error, ErrorKind, Write as _};
 use std::mem;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -239,32 +241,39 @@ fn compress(data: &[u8]) -> Vec<u8> {
     data.into()
 }
 
-/// Decompresses the given data using Snappy decompression.
+/// Decompresses the given data.
+///
+/// The input is untrusted: a torn or corrupt payload is ordinary input here,
+/// not a bug, so this is fallible. Callers treat an error the same way they
+/// treat a checksum mismatch.
 ///
 /// # Arguments
 /// * `compressed_data` - The compressed data to decompress
 ///
 /// # Returns
-/// A `Vec<u8>` containing the decompressed data
+/// A `Vec<u8>` containing the decompressed data, or an
+/// [`ErrorKind::InvalidData`] error if the payload is not a valid frame.
 ///
-/// # Panics
-/// Panics if decompression fails
-fn decompress(compressed_data: &[u8]) -> Vec<u8> {
+/// # Errors
+/// Returns an error if the data cannot be decompressed.
+#[allow(clippy::unnecessary_wraps)] // fallible only with a compression feature on
+fn decompress(compressed_data: &[u8]) -> Result<Vec<u8>, Error> {
     #[cfg(all(feature = "snappy", not(feature = "zstd")))]
     {
         let mut decoder = snap::read::FrameDecoder::new(compressed_data);
         let mut decompressed = Vec::new();
         decoder
             .read_to_end(&mut decompressed)
-            .expect("Failed to decompress data");
-        decompressed
+            .map_err(|e| Error::new(ErrorKind::InvalidData, format!("decompress failed: {e}")))?;
+        Ok(decompressed)
     }
     #[cfg(feature = "zstd")]
     {
-        zstd::decode_all(compressed_data).expect("all in memory")
+        zstd::decode_all(compressed_data)
+            .map_err(|e| Error::new(ErrorKind::InvalidData, format!("decompress failed: {e}")))
     }
     #[cfg(not(any(feature = "zstd", feature = "snappy")))]
-    compressed_data.into()
+    Ok(compressed_data.into())
 }
 
 /// Removes any `blockdb_N.dat` files from `dir`. Used when opening a store
@@ -644,7 +653,14 @@ impl Store {
             let data_file = self.files.get_or_open(file_idx)?;
             data_file.read_at(&mut compressed_block, header_end)?;
 
-            let block = decompress(&compressed_block);
+            // A payload that doesn't decode means we've reached the end of
+            // the valid data — typically a torn write from a crash or ENOSPC
+            // that left a complete header ahead of an incomplete payload.
+            // Treat it exactly like a checksum mismatch: stop here and let
+            // `next_write_offset` overwrite the damage.
+            let Ok(block) = decompress(&compressed_block) else {
+                break;
+            };
             if xxh64(&block, 0) != block_header.checksum {
                 break;
             }
@@ -751,13 +767,13 @@ impl Store {
         let (offset, saved_offset) = self.reserve_space(size_with_header)?;
 
         let (data_file, local_offset, _file_index) = self.files.resolve(offset)?;
-        data_file
-            .write_all_at(&header.serialize(), local_offset)
-            .inspect_err(|_| {
-                counter!("blockstore.write_block", "outcome" => "write_header_failed").increment(1);
-            })?;
 
-        // write the compressed block data
+        // Write the payload first and the header second: the header is the
+        // commit point. If we're interrupted between the two (a crash, or
+        // ENOSPC), what's left on disk is orphan payload bytes with no valid
+        // header ahead of them, which the recovery scan's header checks
+        // already reject. The reverse order leaves a header that validates
+        // in front of a payload that doesn't decode.
         // safe to use wrapping_add here because we checked for overflow above
         // TODO: use a single write_all_at call to write both the header and the data
         // saves a syscall but requires copying the data around in memory
@@ -768,6 +784,12 @@ impl Store {
             )
             .inspect_err(|_| {
                 counter!("blockstore.write_block", "outcome" => "write_data_failed").increment(1);
+            })?;
+
+        data_file
+            .write_all_at(&header.serialize(), local_offset)
+            .inspect_err(|_| {
+                counter!("blockstore.write_block", "outcome" => "write_header_failed").increment(1);
             })?;
 
         if self.sync == SyncMode::Sync {
@@ -999,6 +1021,8 @@ impl Store {
     /// - The file cannot be read
     /// - The block header cannot be decoded
     /// - The block data cannot be read
+    /// - The block data cannot be decompressed (corrupt payload)
+    /// - The checksum does not match
     ///
     /// # Panics
     /// Panics if:
@@ -1054,7 +1078,9 @@ impl Store {
         data_file.read_at(&mut compressed_block, local_offset)?;
 
         // decompress the block data
-        let block = decompress(&compressed_block);
+        let block = decompress(&compressed_block).inspect_err(|_| {
+            counter!("blockstore.read_block", "outcome" => "decompress_failed").increment(1);
+        })?;
 
         // verify the checksum (checksum is calculated on the original uncompressed data)
         let checksum = xxh64(&block, 0);
@@ -1098,7 +1124,10 @@ impl Drop for Store {
             return;
         }
         if self.sync == SyncMode::Sync {
-            self.index_file.sync_all().unwrap();
+            // Panicking in a destructor is never the right answer, least of
+            // all on an I/O error during shutdown: recovery at the next open
+            // handles whatever didn't make it to disk.
+            let _ = self.index_file.sync_all();
         }
         // if this fails, no biggie, we'll just have to do recovery at startup
         let _ = self.checkpoint(*self.data_highwater.lock());
@@ -1910,5 +1939,79 @@ mod tests {
 
         let store = reopen(dir.path()).unwrap();
         assert_eq!(1, store.max_contiguous_height());
+    }
+
+    /// The ENOSPC signature: a block header that passes every sanity check
+    /// followed by a well-formed but *incomplete* compressed frame, then
+    /// zeros. Nothing short of a full decode can tell it from a good block,
+    /// so recovery must handle the decode failure rather than panic.
+    /// Regression test for the `expect("all in memory")` in `decompress`.
+    #[test]
+    fn recovery_handles_torn_tail_block() {
+        let dir = tempfile::tempdir().unwrap();
+        write_blocks_and_crash(dir.path(), 4, 256);
+
+        // Walk the four good blocks to find where the tail starts.
+        let mut tail_offset = 0u64;
+        for _ in 0..4 {
+            let size = read_block_size_field(dir.path(), tail_offset);
+            tail_offset += BlockHeader::SERIALIZED_SIZE as u64 + u64::from(size);
+        }
+
+        // Build a real block for height 5, then keep only the first half of
+        // its payload — the frame magic is intact, the frame is not.
+        let payload = incompressible(5, 4096);
+        let compressed = compress(&payload);
+        let (torn, _discarded) = compressed.split_at(compressed.len() / 2);
+        let header = BlockHeader {
+            height: 5,
+            size: u32::try_from(torn.len()).unwrap(),
+            checksum: xxh64(&payload, 0),
+            version: BlockHeader::BLOCK_ENTRY_VERSION,
+        };
+
+        let path = dir.path().join("blockdb_0.dat");
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all_at(&header.serialize(), tail_offset).unwrap();
+        file.write_all_at(torn, tail_offset + BlockHeader::SERIALIZED_SIZE as u64)
+            .unwrap();
+        // Trailing zeros, as ENOSPC leaves behind.
+        file.write_all_at(
+            &[0u8; 4096],
+            tail_offset + BlockHeader::SERIALIZED_SIZE as u64 + torn.len() as u64,
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+
+        // The store must open, stopping cleanly at the damage.
+        let store = reopen(dir.path()).unwrap();
+        assert_eq!(4, store.max_contiguous_height());
+        assert_eq!(tail_offset, store.header.next_write_offset);
+        for h in 1..=4 {
+            assert!(store.read_block(h).unwrap().is_some(), "block {h}");
+        }
+        // The torn block was never indexed, so it simply isn't there.
+        assert!(store.read_block(5).unwrap().is_none());
+    }
+
+    /// A payload that can't be decompressed at all (magic destroyed) is
+    /// reported through the `Result` from `read_block`, not a panic.
+    #[test]
+    fn read_block_reports_undecodable_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        write_blocks_and_crash(dir.path(), 2, 256);
+
+        // Destroy the frame header of block 2's payload, leaving its index
+        // entry (written before the crash) pointing at it.
+        let block_1_compressed = read_block_size_field(dir.path(), 0);
+        let block_2_payload =
+            u64::from(block_1_compressed) + 2 * BlockHeader::SERIALIZED_SIZE as u64;
+        for i in 0..4 {
+            poke_byte(dir.path(), block_2_payload + i, 0xFF);
+        }
+
+        let store = reopen(dir.path()).unwrap();
+        let err = store.read_block(2).unwrap_err();
+        assert_eq!(ErrorKind::InvalidData, err.kind(), "got: {err}");
     }
 }
