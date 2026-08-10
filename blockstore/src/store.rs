@@ -84,6 +84,13 @@ pub struct Store {
     sync: SyncMode,
     max_contiguous_height: AtomicU64,
     height_highwater: AtomicU64,
+    /// Set once the store is known consistent: either it was created with
+    /// `truncate`, or [`Store::recover`] ran to completion. Until then the
+    /// in-memory state is a half-built picture of the on-disk one — the
+    /// atomics have been populated by the recovery scan while the contiguity
+    /// floor has not been recomputed — and persisting it would overwrite a
+    /// good header with a worse one. `Drop` checkpoints only when this is set.
+    recovered: bool,
     /// When set, `Drop` skips the final checkpoint and lets files close
     /// normally. Used by tests to simulate an unclean shutdown without
     /// leaking handles (which would also retain advisory locks). See
@@ -407,11 +414,16 @@ impl Store {
         let mut result = Self {
             index_file,
             files,
-            data_highwater: Mutex::new(0),
+            // Seed from the header rather than 0. `recover` only assigns this
+            // at the very end, so a 0 here would be visible to anything that
+            // runs on a failed open — notably `Drop` — and persisting it
+            // would erase the only durable pointer to the end of the data.
+            data_highwater: Mutex::new(header.next_write_offset),
             header,
             sync: options.sync,
             max_contiguous_height: AtomicU64::new(options.minimum_height.saturating_sub(1)),
             height_highwater: AtomicU64::new(options.minimum_height.saturating_sub(1)),
+            recovered: options.truncate,
             #[cfg(test)]
             crashed: AtomicBool::default(),
         };
@@ -483,6 +495,7 @@ impl Store {
             .store(contiguous_floor, Ordering::Relaxed);
 
         *self.data_highwater.lock() = self.header.next_write_offset;
+        self.recovered = true;
         Ok(())
     }
 
@@ -970,6 +983,24 @@ impl Store {
     /// # Errors
     /// Returns an error if the header cannot be written.
     fn checkpoint(&self, saved_offset: u64) -> Result<(), Error> {
+        // A store that holds blocks cannot have zero bytes of data. Refuse
+        // rather than persist it: this header is the only durable pointer to
+        // the end of the data file, and a bogus zero sends the next open on a
+        // full rescan of everything — repeatedly, if a supervisor is
+        // restarting us. Loud failure beats silent, repeatable damage.
+        if saved_offset == 0
+            && self.height_highwater.load(Ordering::Relaxed) >= self.header.min_height
+        {
+            counter!("blockstore.checkpoint", "outcome" => "refused_inconsistent").increment(1);
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "refusing to checkpoint next_write_offset=0 with max_height={max_height} (min_height={min_height})",
+                    max_height = self.height_highwater.load(Ordering::Relaxed),
+                    min_height = self.header.min_height,
+                ),
+            ));
+        }
         if self.sync == SyncMode::Sync {
             self.index_file.sync_all()?;
         }
@@ -1128,6 +1159,12 @@ impl Drop for Store {
             // all on an I/O error during shutdown: recovery at the next open
             // handles whatever didn't make it to disk.
             let _ = self.index_file.sync_all();
+        }
+        // An open that never finished recovering has no business writing a
+        // header: its atomics describe a partial scan, and the on-disk header
+        // it would overwrite is strictly better than what it would write.
+        if !self.recovered {
+            return;
         }
         // if this fails, no biggie, we'll just have to do recovery at startup
         let _ = self.checkpoint(*self.data_highwater.lock());
@@ -1992,6 +2029,103 @@ mod tests {
         }
         // The torn block was never indexed, so it simply isn't there.
         assert!(store.read_block(5).unwrap().is_none());
+    }
+
+    /// Reads the on-disk index header directly, bypassing `Store`.
+    fn read_index_header(dir: &Path) -> IndexFileHeader {
+        let file = File::open(dir.join(Store::INDEX_FILE_NAME)).unwrap();
+        let mut header = IndexFileHeader::default();
+        file.read_at(bytemuck::bytes_of_mut(&mut header), 0)
+            .unwrap();
+        header
+    }
+
+    /// An open that fails during `recover` must not checkpoint on the way
+    /// out. Before the fix, `data_highwater` was still its initial 0 while
+    /// the atomics had been populated by the scan, so `Drop` wrote
+    /// `next_write_offset = 0` over a perfectly good header — repeatably,
+    /// so a restart loop could never converge.
+    #[test]
+    fn failed_open_does_not_clobber_header() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(
+                dir.path(),
+                dir.path(),
+                StoreOptions {
+                    truncate: true,
+                    sync: SyncMode::Sync,
+                    minimum_height: 1,
+                    ..StoreOptions::default()
+                },
+            )
+            .unwrap();
+            for h in 1..=4u64 {
+                store.write_block(h, &incompressible(h, 256)).unwrap();
+            }
+        }
+
+        let good = read_index_header(dir.path());
+        assert!(good.next_write_offset > 0);
+        assert_eq!(4, good.max_height);
+
+        // Truncate the data file so it holds fewer bytes than the header
+        // claims — `recover` rejects this outright.
+        let path = dir.path().join("blockdb_0.dat");
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(good.next_write_offset / 2).unwrap();
+        file.sync_all().unwrap();
+
+        let err = reopen(dir.path()).unwrap_err();
+        assert_eq!(ErrorKind::InvalidData, err.kind(), "got: {err}");
+
+        // The header must be exactly as it was: the failed open had nothing
+        // better to say than what was already on disk.
+        let after = read_index_header(dir.path());
+        assert_eq!(good.next_write_offset, after.next_write_offset);
+        assert_eq!(good.max_height, after.max_height);
+        assert_eq!(
+            good.highest_contiguous_block_height,
+            after.highest_contiguous_block_height
+        );
+    }
+
+    /// Belt and braces: even if something else reaches `checkpoint` with a
+    /// zero offset on a store that holds blocks, it refuses rather than
+    /// persisting a header that the write path could never produce.
+    #[test]
+    fn checkpoint_refuses_zero_offset_with_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            dir.path(),
+            StoreOptions {
+                truncate: true,
+                sync: SyncMode::Sync,
+                minimum_height: 1,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+        store.write_block(1, &incompressible(1, 256)).unwrap();
+
+        let err = store.checkpoint(0).unwrap_err();
+        assert_eq!(ErrorKind::InvalidData, err.kind(), "got: {err}");
+
+        // An empty store legitimately has offset 0, so that still works.
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty = Store::open(
+            empty_dir.path(),
+            empty_dir.path(),
+            StoreOptions {
+                truncate: true,
+                sync: SyncMode::Sync,
+                minimum_height: 1,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+        empty.checkpoint(0).unwrap();
     }
 
     /// A payload that can't be decompressed at all (magic destroyed) is
