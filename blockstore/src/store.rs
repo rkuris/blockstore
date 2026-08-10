@@ -84,6 +84,11 @@ pub struct Store {
     sync: SyncMode,
     max_contiguous_height: AtomicU64,
     height_highwater: AtomicU64,
+    /// `next_write_offset` as of the last successful checkpoint. The
+    /// distance from here to the current highwater is exactly what a
+    /// recovery scan would have to re-walk, and is what the byte-based
+    /// checkpoint trigger bounds.
+    last_checkpoint_offset: AtomicU64,
     /// Set once the store is known consistent: either it was created with
     /// `truncate`, or [`Store::recover`] ran to completion. Until then the
     /// in-memory state is a half-built picture of the on-disk one — the
@@ -325,6 +330,19 @@ impl Store {
     /// We write the header to the index file every 1024 blocks
     const CHECKPOINT_INTERVAL: u64 = 1024;
 
+    /// We also checkpoint whenever the data file has grown this much past
+    /// the last checkpoint, regardless of which heights those bytes belonged
+    /// to. [`Self::CHECKPOINT_INTERVAL`] only fires when the tip rises, so on
+    /// its own it never fires at all for a backfill below the tip — exactly
+    /// the workload (bulk historical sync) that most needs bounded recovery.
+    /// This caps how much of the data file a recovery scan has to re-walk.
+    #[cfg(not(test))]
+    const CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+    /// Small under test so the byte trigger can be exercised without writing
+    /// 64 MiB of blocks.
+    #[cfg(test)]
+    const CHECKPOINT_BYTES: u64 = 64 * 1024;
+
     /// Opens (or creates) a store with the given options.
     ///
     /// Both `index_path` and `data_path` must be directories. The index
@@ -419,6 +437,7 @@ impl Store {
             // runs on a failed open — notably `Drop` — and persisting it
             // would erase the only durable pointer to the end of the data.
             data_highwater: Mutex::new(header.next_write_offset),
+            last_checkpoint_offset: AtomicU64::new(header.next_write_offset),
             header,
             sync: options.sync,
             max_contiguous_height: AtomicU64::new(options.minimum_height.saturating_sub(1)),
@@ -833,17 +852,16 @@ impl Store {
 
         self.advance_max_contiguous_height(height);
 
-        if self.update_highwater(height) && height.is_multiple_of(Self::CHECKPOINT_INTERVAL) {
-            self.checkpoint(saved_offset)?;
-        }
-
-        if self
-            .height_highwater
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                if old < height { Some(height) } else { None }
-            })
-            .is_ok()
-            && height.is_multiple_of(Self::CHECKPOINT_INTERVAL)
+        // Two independent triggers, because the height one alone leaves the
+        // recovery gap unbounded: it requires the tip to rise, so a writer
+        // backfilling below the tip (bulk historical sync) never trips it no
+        // matter how many gigabytes it appends. The byte trigger bounds the
+        // gap by how much data was written, independent of write order.
+        let tip_rose = self.update_highwater(height);
+        let bytes_since_checkpoint =
+            saved_offset.saturating_sub(self.last_checkpoint_offset.load(Ordering::Relaxed));
+        if (tip_rose && height.is_multiple_of(Self::CHECKPOINT_INTERVAL))
+            || bytes_since_checkpoint >= Self::CHECKPOINT_BYTES
         {
             self.checkpoint(saved_offset)?;
         }
@@ -1043,6 +1061,8 @@ impl Store {
         header.highest_contiguous_block_height = self.max_contiguous_height.load(Ordering::Relaxed);
         self.index_file
             .write_all_at(bytemuck::bytes_of(&header), 0)?;
+        self.last_checkpoint_offset
+            .store(saved_offset, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2062,6 +2082,52 @@ mod tests {
         }
         // The torn block was never indexed, so it simply isn't there.
         assert!(store.read_block(5).unwrap().is_none());
+    }
+
+    /// A writer that only backfills below the tip never raises the
+    /// highwater, so the height-based trigger never fires and — before the
+    /// byte-based trigger — the data file could grow without bound between
+    /// checkpoints. `CHECKPOINT_BYTES` is 64 KiB under test.
+    #[test]
+    fn backfill_below_tip_still_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            dir.path(),
+            StoreOptions {
+                truncate: true,
+                sync: SyncMode::Sync,
+                minimum_height: 1,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+
+        // Set a high tip first, at a height that is not a multiple of
+        // CHECKPOINT_INTERVAL, so nothing checkpoints on the way up.
+        store.write_block(5000, &incompressible(5000, 300)).unwrap();
+        assert_eq!(0, read_index_header(dir.path()).next_write_offset);
+
+        // Now backfill well below the tip: every one of these leaves the
+        // highwater untouched.
+        for h in 1..=250u64 {
+            store.write_block(h, &incompressible(h, 300)).unwrap();
+        }
+
+        // Checkpointed without a clean shutdown, and within one trigger's
+        // worth of the current position.
+        let header = read_index_header(dir.path());
+        let highwater = *store.data_highwater.lock();
+        assert!(
+            header.next_write_offset > 0,
+            "backfill never checkpointed: header still at 0 after {highwater} bytes",
+        );
+        assert!(
+            highwater.saturating_sub(header.next_write_offset) < Store::CHECKPOINT_BYTES,
+            "recovery gap {gap} exceeds the checkpoint interval",
+            gap = highwater.saturating_sub(header.next_write_offset),
+        );
+        assert_eq!(5000, header.max_height);
     }
 
     /// A write that fails after reserving space must give the space back,
