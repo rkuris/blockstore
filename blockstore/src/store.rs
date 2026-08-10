@@ -96,6 +96,10 @@ pub struct Store {
     /// floor has not been recomputed — and persisting it would overwrite a
     /// good header with a worse one. `Drop` checkpoints only when this is set.
     recovered: bool,
+    /// Counts checkpoints written *during* the recovery scan, so tests can
+    /// assert the scan persists progress instead of only doing so at the end.
+    #[cfg(test)]
+    recovery_checkpoints: AtomicU64,
     /// When set, `Drop` skips the final checkpoint and lets files close
     /// normally. Used by tests to simulate an unclean shutdown without
     /// leaking handles (which would also retain advisory locks). See
@@ -444,6 +448,8 @@ impl Store {
             height_highwater: AtomicU64::new(options.minimum_height.saturating_sub(1)),
             recovered: options.truncate,
             #[cfg(test)]
+            recovery_checkpoints: AtomicU64::default(),
+            #[cfg(test)]
             crashed: AtomicBool::default(),
         };
         if !options.truncate {
@@ -621,12 +627,18 @@ impl Store {
     /// Handles cross-file EOF transitions: if the current scan position
     /// hits the actual byte-end of a data file in multi-file mode, we
     /// advance to the start of the next data file.
+    ///
+    /// Progress is checkpointed every [`Self::CHECKPOINT_BYTES`] so a scan
+    /// that is killed part-way resumes where it stopped instead of starting
+    /// over. On a 17.3 GB store an 18-minute scan that dies at 83% used to
+    /// throw away all of it, every time, forever.
     fn recover_unindexed_blocks(
         &mut self,
         end_offset: u64,
         data_files: &BTreeMap<u32, u64>,
     ) -> Result<(), Error> {
         let cap = self.files.max_data_file_size().map(NonZeroU64::get);
+        let mut last_progress = self.header.next_write_offset;
 
         loop {
             let scan = self.header.next_write_offset;
@@ -724,7 +736,41 @@ impl Store {
                         ),
                     )
                 })?;
+
+            if self.header.next_write_offset.saturating_sub(last_progress) >= Self::CHECKPOINT_BYTES
+            {
+                self.checkpoint_recovery_progress()?;
+                last_progress = self.header.next_write_offset;
+            }
         }
+        Ok(())
+    }
+
+    /// Persists how far the recovery scan has validated, so a kill mid-scan
+    /// resumes from here rather than from the last pre-crash checkpoint.
+    ///
+    /// The index entries must be durable *before* the header points past
+    /// them — the same ordering discipline [`Self::checkpoint`] documents.
+    /// Otherwise a crash between the two leaves blocks that the next scan
+    /// skips over and the index never described. That is worth a sync even
+    /// in `SyncMode::Async`: it happens once per `CHECKPOINT_BYTES`, and the
+    /// whole point of the checkpoint is to be durable.
+    ///
+    /// `highest_contiguous_block_height` is deliberately left at its
+    /// persisted value. The `max_contiguous_height` atomic is a running
+    /// *maximum* during the scan, not a contiguity floor — the real floor is
+    /// only computed by `scan_contiguous_floor` once the scan finishes — and
+    /// persisting the maximum would claim contiguity across gaps.
+    fn checkpoint_recovery_progress(&mut self) -> Result<(), Error> {
+        self.index_file.sync_all()?;
+        self.header.max_height = self.height_highwater.load(Ordering::Relaxed);
+        self.index_file
+            .write_all_at(bytemuck::bytes_of(&self.header), 0)?;
+        self.last_checkpoint_offset
+            .store(self.header.next_write_offset, Ordering::Relaxed);
+        #[cfg(test)]
+        self.recovery_checkpoints.fetch_add(1, Ordering::Relaxed);
+        counter!("blockstore.recovery_checkpoint").increment(1);
         Ok(())
     }
 
@@ -2180,6 +2226,99 @@ mod tests {
         file.read_at(bytemuck::bytes_of_mut(&mut header), 0)
             .unwrap();
         header
+    }
+
+    /// Writes the on-disk index header directly, bypassing `Store`.
+    fn write_index_header(dir: &Path, header: &IndexFileHeader) {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(dir.join(Store::INDEX_FILE_NAME))
+            .unwrap();
+        file.write_all_at(bytemuck::bytes_of(header), 0).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    /// A recovery scan long enough to matter must persist progress as it
+    /// goes. Without this, a scan killed at 83% throws away all of it and
+    /// the next attempt starts from zero — which under restart supervision
+    /// never converges. `CHECKPOINT_BYTES` is 64 KiB under test.
+    #[test]
+    fn recovery_checkpoints_progress_incrementally() {
+        let dir = tempfile::tempdir().unwrap();
+        write_blocks_and_crash(dir.path(), 500, 300);
+
+        // Simulate the worst case this has to survive: a header pointing at
+        // offset 0, so the whole data file is rescanned.
+        let mut header = read_index_header(dir.path());
+        assert!(header.next_write_offset > 0);
+        let data_len = fs::metadata(dir.path().join("blockdb_0.dat"))
+            .unwrap()
+            .len();
+        assert!(
+            data_len > 2 * Store::CHECKPOINT_BYTES,
+            "test needs a scan long enough to checkpoint more than once",
+        );
+        header.next_write_offset = 0;
+        write_index_header(dir.path(), &header);
+
+        let store = reopen(dir.path()).unwrap();
+
+        let checkpoints = store.recovery_checkpoints.load(Ordering::Relaxed);
+        assert!(
+            checkpoints >= 2,
+            "scan of {data_len} bytes checkpointed {checkpoints} times",
+        );
+
+        // And it still recovers everything, correctly.
+        assert_eq!(500, store.max_contiguous_height());
+        assert_eq!(500, store.height_highwater());
+        for h in [1u64, 250, 500] {
+            assert_eq!(
+                Some(incompressible(h, 300).into()),
+                store.read_block(h).unwrap(),
+                "block {h}",
+            );
+        }
+    }
+
+    /// A checkpoint written mid-scan must not persist the running maximum
+    /// height as the contiguity floor: during recovery that atomic is a max,
+    /// not a floor, and claiming contiguity across a gap would let the next
+    /// open skip real gaps.
+    #[test]
+    fn recovery_checkpoint_does_not_claim_false_contiguity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            dir.path(),
+            StoreOptions {
+                truncate: true,
+                sync: SyncMode::Sync,
+                minimum_height: 1,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+        // A gap at height 3, with enough volume above it to trip a
+        // mid-scan checkpoint.
+        for h in (1..=500u64).filter(|h| *h != 3) {
+            store.write_block(h, &incompressible(h, 300)).unwrap();
+        }
+        simulate_crash(store);
+
+        let mut header = read_index_header(dir.path());
+        header.next_write_offset = 0;
+        header.highest_contiguous_block_height = 0;
+        write_index_header(dir.path(), &header);
+
+        let store = reopen(dir.path()).unwrap();
+        assert!(store.recovery_checkpoints.load(Ordering::Relaxed) >= 2);
+        // The floor stops below the gap even though heights up to 500 were
+        // recovered and checkpointed along the way.
+        assert_eq!(2, store.max_contiguous_height());
+        assert_eq!(500, store.height_highwater());
+        assert!(store.read_block(3).unwrap().is_none());
+        assert!(store.read_block(500).unwrap().is_some());
     }
 
     /// An open that fails during `recover` must not checkpoint on the way
