@@ -774,42 +774,51 @@ impl Store {
         // Reserve space in the data file(s). In multi-file mode, this may
         // skip past the tail of the current data file if the block would
         // cross a file boundary; the skipped bytes are never read.
-        // TODO: what happens if we run out of space after updating the
-        // highwater mark? We can't really reduce it because someone else may
-        // already be writing past us, but we might want to consider restoring it?
-        let (offset, saved_offset) = self.reserve_space(size_with_header)?;
+        let (offset, saved_offset, previous_highwater) = self.reserve_space(size_with_header)?;
 
-        let (data_file, local_offset, _file_index) = self.files.resolve(offset)?;
+        // Everything from here to the sync is the reservation's to lose: if
+        // any of it fails, the bytes never landed and the highwater must not
+        // be left pointing past them. See `release_reservation`.
+        let write_result = (|| -> Result<(), Error> {
+            let (data_file, local_offset, _file_index) = self.files.resolve(offset)?;
 
-        // Write the payload first and the header second: the header is the
-        // commit point. If we're interrupted between the two (a crash, or
-        // ENOSPC), what's left on disk is orphan payload bytes with no valid
-        // header ahead of them, which the recovery scan's header checks
-        // already reject. The reverse order leaves a header that validates
-        // in front of a payload that doesn't decode.
-        // safe to use wrapping_add here because we checked for overflow above
-        // TODO: use a single write_all_at call to write both the header and the data
-        // saves a syscall but requires copying the data around in memory
-        data_file
-            .write_all_at(
-                &compressed_block,
-                local_offset.wrapping_add(BlockHeader::SERIALIZED_SIZE as u64),
-            )
-            .inspect_err(|_| {
-                counter!("blockstore.write_block", "outcome" => "write_data_failed").increment(1);
-            })?;
+            // Write the payload first and the header second: the header is
+            // the commit point. If we're interrupted between the two (a
+            // crash, or ENOSPC), what's left on disk is orphan payload bytes
+            // with no valid header ahead of them, which the recovery scan's
+            // header checks already reject. The reverse order leaves a header
+            // that validates in front of a payload that doesn't decode.
+            // safe to use wrapping_add here because we checked for overflow above
+            // TODO: use a single write_all_at call to write both the header and the data
+            // saves a syscall but requires copying the data around in memory
+            data_file
+                .write_all_at(
+                    &compressed_block,
+                    local_offset.wrapping_add(BlockHeader::SERIALIZED_SIZE as u64),
+                )
+                .inspect_err(|_| {
+                    counter!("blockstore.write_block", "outcome" => "write_data_failed")
+                        .increment(1);
+                })?;
 
-        data_file
-            .write_all_at(&header.serialize(), local_offset)
-            .inspect_err(|_| {
-                counter!("blockstore.write_block", "outcome" => "write_header_failed").increment(1);
-            })?;
+            data_file
+                .write_all_at(&header.serialize(), local_offset)
+                .inspect_err(|_| {
+                    counter!("blockstore.write_block", "outcome" => "write_header_failed")
+                        .increment(1);
+                })?;
 
-        if self.sync == SyncMode::Sync {
-            #[cfg(feature = "metrics")]
-            let sync_start = Instant::now();
-            data_file.sync_all()?;
-            record_duration!(sync_start, "blockstore.write_block.sync.duration_seconds");
+            if self.sync == SyncMode::Sync {
+                #[cfg(feature = "metrics")]
+                let sync_start = Instant::now();
+                data_file.sync_all()?;
+                record_duration!(sync_start, "blockstore.write_block.sync.duration_seconds");
+            }
+            Ok(())
+        })();
+        if let Err(e) = write_result {
+            self.release_reservation(previous_highwater, saved_offset);
+            return Err(e);
         }
 
         // update the index file
@@ -847,12 +856,17 @@ impl Store {
 
     /// Reserves `size_with_header` bytes in the data file(s).
     ///
-    /// Returns `(write_offset, new_highwater)`. In multi-file mode, if the
-    /// block would cross a file boundary, `write_offset` is advanced to the
-    /// start of the next data file (the bytes from `data_highwater` up to
-    /// that point are leaked and will never be read). Mirrors blockdb's
-    /// `allocateBlockSpace`.
-    fn reserve_space(&self, size_with_header: u64) -> Result<(u64, u64), Error> {
+    /// Returns `(write_offset, new_highwater, previous_highwater)`. In
+    /// multi-file mode, if the block would cross a file boundary,
+    /// `write_offset` is advanced to the start of the next data file (the
+    /// bytes from `data_highwater` up to that point are leaked and will never
+    /// be read). Mirrors blockdb's `allocateBlockSpace`.
+    ///
+    /// `previous_highwater` is what the highwater was before this
+    /// reservation, so a write that fails can hand the space back with
+    /// [`Self::release_reservation`] — including the skipped tail, which is
+    /// only worth leaking for a block that actually lands.
+    fn reserve_space(&self, size_with_header: u64) -> Result<(u64, u64, u64), Error> {
         let max = self.files.max_data_file_size().map(NonZeroU64::get);
 
         // Reject blocks that can't fit in a single file at all.
@@ -914,7 +928,26 @@ impl Store {
             )
         })?;
         *guard = new_highwater;
-        Ok((write_offset, new_highwater))
+        Ok((write_offset, new_highwater, current))
+    }
+
+    /// Gives back a reservation whose write never landed, so the highwater
+    /// stops pointing past bytes that don't exist.
+    ///
+    /// Only safe while we are still the last reserver. If another writer has
+    /// already reserved past `reserved_end`, rewinding would hand our range
+    /// out a second time and overlap their block, so the reservation is left
+    /// as a hole instead. A hole is survivable — it reads back as zeros,
+    /// which the recovery scan's header checks reject cleanly — whereas
+    /// overlapping writes are not.
+    fn release_reservation(&self, previous_highwater: u64, reserved_end: u64) {
+        let mut guard = self.data_highwater.lock();
+        if *guard == reserved_end {
+            *guard = previous_highwater;
+            counter!("blockstore.reserve_space", "outcome" => "rolled_back").increment(1);
+        } else {
+            counter!("blockstore.reserve_space", "outcome" => "rollback_skipped").increment(1);
+        }
     }
 
     fn advance_max_contiguous_height(&self, height: BlockHeight) {
@@ -2029,6 +2062,49 @@ mod tests {
         }
         // The torn block was never indexed, so it simply isn't there.
         assert!(store.read_block(5).unwrap().is_none());
+    }
+
+    /// A write that fails after reserving space must give the space back,
+    /// otherwise the next successful write leaves a hole behind it and the
+    /// highwater points past bytes that never landed.
+    ///
+    /// The failure is forced by making the data directory read-only, so
+    /// creating the next data file fails — a spill into a new file is the
+    /// one failure mode reachable without a real full disk.
+    #[test]
+    fn failed_write_rolls_back_reservation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cap = 400u64;
+        let store = open_with_cap(dir.path(), cap, true, 1).unwrap();
+        store.write_block(1, &incompressible(1, 300)).unwrap();
+        let highwater_before = *store.data_highwater.lock();
+
+        let ro = fs::Permissions::from_mode(0o555);
+        let rw = fs::Permissions::from_mode(0o755);
+        fs::set_permissions(dir.path(), ro).unwrap();
+        let result = store.write_block(2, &incompressible(2, 300));
+        fs::set_permissions(dir.path(), rw).unwrap();
+
+        if result.is_ok() {
+            // Running as a user that ignores directory permissions (root).
+            // Nothing to assert; don't fail on the environment.
+            return;
+        }
+        assert_eq!(
+            highwater_before,
+            *store.data_highwater.lock(),
+            "reservation for the failed write was not released"
+        );
+
+        // And the store keeps working: the next write reuses the space
+        // rather than writing past a gap.
+        store.write_block(2, &incompressible(2, 300)).unwrap();
+        assert_eq!(
+            Some(incompressible(2, 300).into()),
+            store.read_block(2).unwrap()
+        );
     }
 
     /// Reads the on-disk index header directly, bypassing `Store`.

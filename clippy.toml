@@ -1,1 +1,7 @@
 doc-valid-idents = ["LevelDB", ".."]
+# `syn` is duplicated purely transitively: bytemuck_derive and clap_derive
+# have moved to syn 3 while cbindgen and equator-macro are still on syn 2.
+# Nothing in this workspace depends on syn directly, so there is no version
+# to unify — and since Cargo.lock is not committed, CI re-resolves on every
+# run and trips `multiple_crate_versions` the moment any of them shifts.
+allowed-duplicate-crates = ["syn"]

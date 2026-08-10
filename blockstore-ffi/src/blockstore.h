@@ -32,7 +32,11 @@ typedef struct OwnedSlice_u8 OwnedBytes;
  * The result type returned from an FFI function that returns no value but may
  * return an error.
  */
-enum VoidResult_Tag {
+enum VoidResult_Tag
+#if __STDC_VERSION__ >= 202311L
+  : size_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
   /**
    * The caller provided a null pointer to the input handle.
    */
@@ -52,7 +56,11 @@ enum VoidResult_Tag {
    */
   VoidResult_Err,
 };
+#if __STDC_VERSION__ >= 202311L
+typedef enum VoidResult_Tag VoidResult_Tag;
+#else
 typedef size_t VoidResult_Tag;
+#endif // __STDC_VERSION__ >= 202311L
 
 typedef struct VoidResult {
   VoidResult_Tag tag;
@@ -68,7 +76,11 @@ typedef uint64_t BlockHeight;
 /**
  * The result type returned from the open store function.
  */
-enum StoreHandleResult_Tag {
+enum StoreHandleResult_Tag
+#if __STDC_VERSION__ >= 202311L
+  : size_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
   /**
    * The store was opened successfully and the handle is returned as an
    * opaque pointer.
@@ -90,7 +102,11 @@ enum StoreHandleResult_Tag {
    */
   StoreHandleResult_Err,
 };
+#if __STDC_VERSION__ >= 202311L
+typedef enum StoreHandleResult_Tag StoreHandleResult_Tag;
+#else
 typedef size_t StoreHandleResult_Tag;
+#endif // __STDC_VERSION__ >= 202311L
 
 typedef struct StoreHandleResult {
   StoreHandleResult_Tag tag;
@@ -174,7 +190,11 @@ typedef struct StoreArgs {
 /**
  * The result type returned from FFI functions that retrieve a single block.
  */
-enum BlockResult_Tag {
+enum BlockResult_Tag
+#if __STDC_VERSION__ >= 202311L
+  : size_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
   /**
    * The caller provided a null pointer to the store handle.
    */
@@ -203,7 +223,11 @@ enum BlockResult_Tag {
    */
   BlockResult_Err,
 };
+#if __STDC_VERSION__ >= 202311L
+typedef enum BlockResult_Tag BlockResult_Tag;
+#else
 typedef size_t BlockResult_Tag;
+#endif // __STDC_VERSION__ >= 202311L
 
 typedef struct BlockResult {
   BlockResult_Tag tag;
