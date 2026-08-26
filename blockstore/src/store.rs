@@ -951,9 +951,18 @@ impl Store {
             // with no valid header ahead of them, which the recovery scan's
             // header checks already reject. The reverse order leaves a header
             // that validates in front of a payload that doesn't decode.
+            //
+            // Deliberately not folded into one `write_all_at`: that would
+            // cost a copy of the whole payload into a header-prefixed
+            // buffer, and — the real objection — a single write is no more
+            // atomic than two. A torn one-shot write can leave the header
+            // on disk in front of a partial payload, which is precisely
+            // the state the ordering above rules out: with the header
+            // written last, a valid header is proof that the payload
+            // beneath it already landed. The extra syscall buys that
+            // guarantee; it isn't waste.
+            //
             // safe to use wrapping_add here because we checked for overflow above
-            // TODO: use a single write_all_at call to write both the header and the data
-            // saves a syscall but requires copying the data around in memory
             data_file
                 .write_all_at(
                     &compressed_block,
