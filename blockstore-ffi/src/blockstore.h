@@ -173,6 +173,14 @@ typedef struct StoreArgs {
    */
   uint64_t max_data_file_size;
   /**
+   * Lowest block height this store will accept. Unlike the other numeric
+   * fields, `0` is *not* a request for a default: it means "the first
+   * block is height 0". The value is passed through verbatim, and writes
+   * below it fail. Only applied when the store is created or truncated;
+   * otherwise the on-disk value wins.
+   */
+  uint64_t minimum_height;
+  /**
    * Maximum number of open data-file handles to keep cached. `0` means
    * use the default ([`DEFAULT_MAX_DATA_FILES`]).
    */

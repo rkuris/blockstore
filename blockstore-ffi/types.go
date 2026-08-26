@@ -32,6 +32,13 @@ type StoreConfig struct {
 	// MaxDataFiles bounds how many open data-file handles are cached.
 	// Zero means use the Rust-side default (10).
 	MaxDataFiles int
+
+	// MinimumHeight is the lowest height the store will accept a block at.
+	// Unlike MaxDataFileSize and MaxDataFiles, zero is not a request for a
+	// default: it means "the first block is height 0". Writes below this
+	// height fail. Only applied when the store is created or truncated;
+	// otherwise the minimum recorded on disk wins.
+	MinimumHeight uint64
 }
 
 type StoreInterface interface {

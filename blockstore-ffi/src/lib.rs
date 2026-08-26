@@ -59,6 +59,12 @@ pub struct StoreArgs<'a> {
     /// at that many bytes and rolls into the next file when a block would
     /// cross the boundary.
     pub max_data_file_size: u64,
+    /// Lowest block height this store will accept. Unlike the other numeric
+    /// fields, `0` is *not* a request for a default: it means "the first
+    /// block is height 0". The value is passed through verbatim, and writes
+    /// below it fail. Only applied when the store is created or truncated;
+    /// otherwise the on-disk value wins.
+    pub minimum_height: u64,
     /// Maximum number of open data-file handles to keep cached. `0` means
     /// use the default ([`DEFAULT_MAX_DATA_FILES`]).
     pub max_data_files: usize,
@@ -98,7 +104,7 @@ pub extern "C" fn bs_open_store(args: StoreArgs<'_>) -> StoreHandleResult {
                 cache_size,
                 truncate: args.truncate,
                 sync: args.sync,
-                minimum_height: 1,
+                minimum_height: args.minimum_height,
                 max_data_file_size: NonZeroU64::new(args.max_data_file_size),
                 max_data_files,
             },

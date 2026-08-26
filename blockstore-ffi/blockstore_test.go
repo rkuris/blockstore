@@ -69,6 +69,46 @@ func TestHeightAccessors(t *testing.T) {
 	assert.Equal(t, uint64(1), store.MinBlockHeight())
 }
 
+// TestMinimumHeight covers StoreConfig.MinimumHeight passing through
+// verbatim, including the zero case, where 0 means "the first block is
+// height 0" rather than "use a default".
+func TestMinimumHeight(t *testing.T) {
+	for _, minHeight := range []uint64{0, 1, 100} {
+		t.Run(fmt.Sprintf("min_%d", minHeight), func(t *testing.T) {
+			dir, err := os.MkdirTemp("", "blockstore_test")
+			require.NoError(t, err)
+			defer os.RemoveAll(dir)
+
+			store, err := OpenRustStore(StoreConfig{
+				Path:          dir,
+				Sync:          Async,
+				Truncate:      true,
+				MinimumHeight: minHeight,
+			})
+			require.NoError(t, err)
+			defer store.Close()
+
+			assert.Equal(t, minHeight, store.MinBlockHeight())
+
+			data := []byte("first block")
+			require.NoError(t, store.WriteBlock(Block{Height: minHeight, Data: data}))
+
+			block, err := store.ReadBlock(minHeight)
+			require.NoError(t, err)
+			assert.Equal(t, data, block)
+
+			// Writing below the minimum height is rejected by the core
+			// library: the index slot offset underflows, which surfaces as
+			// "Invalid block height".
+			if minHeight > 0 {
+				err = store.WriteBlock(Block{Height: minHeight - 1, Data: data})
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "Invalid block height")
+			}
+		})
+	}
+}
+
 // ExampleOpenRustStore documents the StoreConfig surface for Go callers.
 // The multi-file algorithm itself is covered by the Rust unit tests; this
 // just shows how to wire up the options.
@@ -85,6 +125,7 @@ func ExampleOpenRustStore() {
 		Truncate:        true,
 		MaxDataFileSize: 1 << 30, // 1 GiB per blockdb_N.dat (0 = unlimited)
 		MaxDataFiles:    16,      // open-fd cache size (0 = default)
+		MinimumHeight:   1,       // first accepted height (0 = height 0, not a default)
 	})
 	if err != nil {
 		log.Fatal(err)
