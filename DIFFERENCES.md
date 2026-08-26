@@ -60,32 +60,43 @@ off, so there's no runtime cost in builds that don't want them). The
 pattern mirrors firewood's: a single counter name with structured
 labels distinguishing the variants.
 
-Current counters (under the `blockstore.` prefix):
+The naming rules, rather than an inventory (an inventory in a
+markdown file drifts from the code the first time someone adds a
+call site):
 
-| Counter | Labels | Where |
+- Every metric is prefixed `blockstore.`.
+- A counter is named after the *operation*, not the outcome; the
+  outcome is a label. So it's `blockstore.read_block` with
+  `outcome=success|not_found|checksum_mismatch|…`, not a family of
+  `read_block.success`-style names. Cache lookups use `result=hit|miss`.
+- Latency is a `metrics::histogram!` recording seconds as a float,
+  and the name ends in `.duration_seconds`, per Prometheus
+  convention.
+
+Two examples:
+
+| Metric | Kind | Labels |
 |---|---|---|
-| `read_block.success` | — | per successful read |
-| `read_block.not_found` | — | block doesn't exist |
-| `read_block.checksum_mismatch` | — | corrupt block detected on read |
-| `read_block.read_header_failed` | — | header read I/O error |
-| `read_block.read_index_entry_failed` | — | index lookup failure |
-| `read_block.block_size_mismatch` | — | index/header size disagree |
-| `read_block.block_size_too_large` | — | reject oversized block |
-| `read_block.success.duration_ms` | — | latency histogram |
-| `write_block.success` | — | per successful write |
-| `write_block.empty` | — | reject zero-length block |
-| `write_block.block_too_large` | — | reject oversized block |
-| `write_block.invalid_block_height` | — | reject height < min |
-| `write_block.block_exceeds_file_size` | — | reject block > max_data_file_size |
-| `write_block.offset_overflow` | — | u64 offset arithmetic overflow |
-| `write_block.out_of_order` | — | write filled a gap, not the next height |
-| `write_block.write_header_failed` | — | data-file header write failed |
-| `write_block.write_data_failed` | — | data-file payload write failed |
-| `write_block.success.duration_ms` | — | latency histogram |
-| `write_block.sync_duration_ms` | — | `fsync` latency under sync mode |
-| `cache.read` | `result=hit\|miss` | every cache lookup |
-| `cache.populate` | `outcome=ok\|oversize` | post-miss cache insert |
-| `cache.populate_on_write` | `outcome=ok\|oversize` | write-side cache insert |
+| `blockstore.read_block` | counter | `outcome=success\|not_found\|checksum_mismatch\|decompress_failed\|…` |
+| `blockstore.cache.read` | counter | `result=hit\|miss` |
+| `blockstore.read_block.duration_seconds` | histogram | — |
+
+The authoritative list is the call sites themselves — every one goes
+through the `counter!` / `record_duration!` macros in
+[`blockstore/src/metrics.rs`](./blockstore/src/metrics.rs), so:
+
+```bash
+# every counter, with its labels
+rg -o 'counter!\("[^"]+"(, "[^"]+" => "[^"]+")*' blockstore/src
+# every latency histogram
+rg -o 'record_duration!\([^,]+, "[^"]+"' blockstore/src
+```
+
+Operations instrumented today: `read_block`, `write_block`,
+`read_index_entry`, `update_index`, `reserve_space`, `checkpoint`,
+`recovery_checkpoint`, `recovery_index_entry`, and the three
+`cache.*` counters. Histograms cover `read_block`, `write_block`,
+and `write_block.sync` (the `fsync` under `SyncMode::Sync`).
 
 **Why it's useful:** the cache counters in particular answer the
 "is my cache budget reasonable?" question directly:
