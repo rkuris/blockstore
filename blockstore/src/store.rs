@@ -1262,13 +1262,6 @@ impl Store {
             .checked_add(mem::size_of::<IndexFileHeader>() as u64)
     }
 
-    fn read_block_header_at(&self, offset: u64) -> Result<BlockHeader, Error> {
-        let mut buf = [0u8; BlockHeader::SERIALIZED_SIZE];
-        let (data_file, local_offset, _file_index) = self.files.resolve(offset)?;
-        data_file.read_at(&mut buf, local_offset)?;
-        BlockHeader::deserialize(&buf)
-    }
-
     fn read_index_entry(&self, height: BlockHeight) -> Result<Option<IndexEntry>, Error> {
         let offset = self.index_entry_offset(height).ok_or_else(|| {
             counter!("blockstore.read_index_entry", "outcome" => "invalid_block_height")
@@ -1294,7 +1287,7 @@ impl Store {
     /// # Panics
     /// Panics if:
     /// - The cache lock has been poisoned.
-    /// - The file offset somehow overflows
+    /// - The block length plus the header size somehow overflows a `usize`
     pub fn read_block(&self, height: BlockHeight) -> Result<Option<Block>, Error> {
         #[cfg(feature = "metrics")]
         let start = Instant::now();
@@ -1311,22 +1304,24 @@ impl Store {
             counter!("blockstore.read_block", "outcome" => "not_found").increment(1);
             return Ok(None);
         }
-        // TODO: we know the size and can read the whole header and data in one read...
 
-        // read the block header
-        let blockheader = self.read_block_header_at(entry.offset).inspect_err(|_| {
-            counter!("blockstore.read_block", "outcome" => "read_header_failed").increment(1);
-        })?;
+        // The index entry already carries the payload length, so the header
+        // and the payload come back in one pread instead of two. A block
+        // never straddles a data-file boundary — `reserve_space` skips to
+        // the start of the next data file rather than writing across the
+        // cap — so a single `resolve` covers both halves.
 
-        if blockheader.size != block_size {
-            counter!("blockstore.read_block", "outcome" => "block_size_mismatch").increment(1);
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "block size in index file does not match data",
-            ));
+        // The index entry is untrusted: a bit flip in its size field must
+        // not turn into a multi-gigabyte allocation below. Both the write
+        // path and the recovery scan bound blocks by `MAX_BLOCK_SIZE`, so
+        // anything larger cannot be a block this store wrote. Checking
+        // here also preserves the old two-read behaviour of rejecting an
+        // implausible size *before* allocating for it.
+        if block_size > BlockHeader::MAX_BLOCK_SIZE {
+            counter!("blockstore.read_block", "outcome" => "block_size_too_large").increment(1);
+            return Err(Error::new(ErrorKind::InvalidData, "block size too large"));
         }
 
-        // read the compressed block data
         // this conversion is infallable on 64 bit systems, but not on 32 bit systems
         let block_size: usize = block_size
             .try_into()
@@ -1335,17 +1330,43 @@ impl Store {
             })
             .map_err(|_| Error::new(ErrorKind::InvalidData, "block size too large"))?;
 
-        let mut compressed_block = vec![0; block_size];
-        // checked_add should be infallable (overflowing here means that the block offset is almost at 2^64, which is insane)
-        let block_global_offset = entry
-            .offset
-            .checked_add(BlockHeader::SERIALIZED_SIZE as u64)
-            .expect("block offset overflow");
-        let (data_file, local_offset, _file_index) = self.files.resolve(block_global_offset)?;
-        data_file.read_at(&mut compressed_block, local_offset)?;
+        // checked_add is infallable for any block that exists on disk: the
+        // payload length came out of a u32 and the header is 22 bytes.
+        let read_size = block_size
+            .checked_add(BlockHeader::SERIALIZED_SIZE)
+            .expect("block size overflow");
+        let mut buf = vec![0u8; read_size];
+        let (data_file, local_offset, _file_index) = self.files.resolve(entry.offset)?;
+        // `read_exact_at` rather than `read_at`: a short pread would leave
+        // the tail of the buffer zero-filled and we would go on to
+        // decompress those zeros instead of reporting the truncation.
+        data_file
+            .read_exact_at(&mut buf, local_offset)
+            .inspect_err(|_| {
+                counter!("blockstore.read_block", "outcome" => "read_header_failed").increment(1);
+            })?;
+
+        let Some((header_bytes, compressed_block)) =
+            buf.split_at_checked(BlockHeader::SERIALIZED_SIZE)
+        else {
+            // Unreachable: `read_size` is the header plus the payload.
+            counter!("blockstore.read_block", "outcome" => "read_header_failed").increment(1);
+            return Err(Error::new(ErrorKind::InvalidData, "short block read"));
+        };
+        let blockheader = BlockHeader::deserialize(header_bytes).inspect_err(|_| {
+            counter!("blockstore.read_block", "outcome" => "read_header_failed").increment(1);
+        })?;
+
+        if blockheader.size != entry.size {
+            counter!("blockstore.read_block", "outcome" => "block_size_mismatch").increment(1);
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "block size in index file does not match data",
+            ));
+        }
 
         // decompress the block data
-        let block = decompress(&compressed_block).inspect_err(|_| {
+        let block = decompress(compressed_block).inspect_err(|_| {
             counter!("blockstore.read_block", "outcome" => "decompress_failed").increment(1);
         })?;
 
@@ -2668,5 +2689,51 @@ mod tests {
         let store = reopen(dir.path()).unwrap();
         let err = store.read_block(2).unwrap_err();
         assert_eq!(ErrorKind::InvalidData, err.kind(), "got: {err}");
+    }
+
+    /// Overwrites the `size` field of the index entry for `height`, the way
+    /// a bit flip in the index would, leaving the data file intact.
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "test helper with known-small offsets"
+    )]
+    fn poke_index_entry_size(dir: &Path, min_height: u64, height: u64, size: u32) {
+        let entry_offset = mem::size_of::<IndexFileHeader>() as u64
+            + (height - min_height) * mem::size_of::<IndexEntry>() as u64;
+        let file = OpenOptions::new()
+            .write(true)
+            .open(dir.join(Store::INDEX_FILE_NAME))
+            .unwrap();
+        // IndexEntry layout: offset(8) || size(4) || reserved(4)
+        file.write_all_at(&size.to_le_bytes(), entry_offset + 8)
+            .unwrap();
+        file.sync_all().unwrap();
+    }
+
+    /// An index entry claiming a block larger than `MAX_BLOCK_SIZE` is
+    /// rejected before `read_block` allocates a buffer that size. The store
+    /// stays open across the corruption, so recovery never gets a chance to
+    /// repair the entry first.
+    #[test]
+    fn read_block_rejects_implausible_index_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            dir.path(),
+            StoreOptions {
+                truncate: true,
+                sync: SyncMode::Async,
+                minimum_height: 1,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+        store.write_block(1, &incompressible(1, 256)).unwrap();
+
+        poke_index_entry_size(dir.path(), 1, 1, BlockHeader::MAX_BLOCK_SIZE + 1);
+
+        let err = store.read_block(1).unwrap_err();
+        assert_eq!(ErrorKind::InvalidData, err.kind(), "got: {err}");
+        assert!(err.to_string().contains("too large"), "got: {err}");
     }
 }
