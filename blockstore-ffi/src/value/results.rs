@@ -4,8 +4,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::sync::Arc;
 
-use blockstore::Store;
-
+use crate::Store;
 use crate::value::OwnedBytes;
 
 /// The result type returned from an FFI function that returns no value but may

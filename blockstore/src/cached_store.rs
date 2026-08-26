@@ -33,6 +33,16 @@ impl HeapSize for CacheEntry {
 ///
 /// Operations match `Store`'s API. Writes go through to the underlying
 /// store and populate the cache; reads check the cache first.
+///
+/// **Concurrency cost.** The LRU sits behind a single mutex that every
+/// operation takes exclusively: a read has to update recency order even on
+/// a hit, and a write inserts the block it just wrote. Cached reads and
+/// writes therefore serialise against each other, where a bare [`Store`]
+/// takes no lock at all to read (positional reads run fully in parallel)
+/// and only a brief one to allocate space for a write. A cache buys
+/// latency on repeated reads of a working set and costs throughput when
+/// many threads touch distinct heights at once; for the latter, use
+/// [`Store`] directly.
 #[derive(Debug)]
 pub struct CachedStore {
     inner: Store,
@@ -105,6 +115,12 @@ impl CachedStore {
 
     pub fn max_contiguous_height(&self) -> BlockHeight {
         self.inner.max_contiguous_height()
+    }
+
+    /// Highest block height ever written, regardless of contiguity. See
+    /// [`Store::height_highwater`].
+    pub fn height_highwater(&self) -> BlockHeight {
+        self.inner.height_highwater()
     }
 
     pub fn min_block_height(&self) -> BlockHeight {

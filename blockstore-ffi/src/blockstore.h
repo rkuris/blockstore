@@ -10,6 +10,16 @@ typedef enum SyncMode {
   SyncMode_Sync = 1,
 } SyncMode;
 
+/**
+ * The opaque store handle handed out to C.
+ *
+ * `bs_open_store` picks the variant from [`StoreArgs::cache_size`]: zero
+ * opens the store directly, any other value wraps it in the byte-budgeted
+ * LRU read cache. The two have identical method surfaces, so the accessors
+ * below are pure forwards. An enum rather than `Box<dyn ...>` keeps the
+ * dispatch a branch on a tag instead of a vtable hop on every block read,
+ * and keeps the handle one allocation.
+ */
 typedef struct Store Store;
 
 /**
@@ -162,7 +172,16 @@ typedef struct StoreArgs {
    */
   BorrowedBytes path;
   /**
-   * Read cache size, in bytes. Must be greater than zero.
+   * Byte budget for the LRU read cache. `0` opens the store without a
+   * cache, so every read goes to the index and data files; any other
+   * value caps the cache's tracked heap occupancy at that many bytes.
+   *
+   * A non-zero budget costs concurrency. The LRU sits behind a single
+   * mutex that every read and every write takes exclusively -- a cache
+   * hit still has to update recency order -- so cached reads and writes
+   * serialise against each other, while the uncached read path takes no
+   * lock at all. Prefer `0` when many threads read and write distinct
+   * heights; prefer a budget when the workload re-reads a working set.
    */
   size_t cache_size;
   /**

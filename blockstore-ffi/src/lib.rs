@@ -9,7 +9,10 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
-use blockstore::{BlockHeight, DEFAULT_MAX_DATA_FILES, Store, StoreOptions, SyncMode};
+use blockstore::{
+    Block, BlockHeight, CachedStore, DEFAULT_MAX_DATA_FILES, Store as CoreStore, StoreOptions,
+    SyncMode,
+};
 
 pub use crate::value::*;
 use crate::value::{CResult, NullHandleResult};
@@ -45,6 +48,57 @@ fn invoke_with_handle<H, T: NullHandleResult, V: Into<T>>(
     }
 }
 
+/// The opaque store handle handed out to C.
+///
+/// `bs_open_store` picks the variant from [`StoreArgs::cache_size`]: zero
+/// opens the store directly, any other value wraps it in the byte-budgeted
+/// LRU read cache. The two have identical method surfaces, so the accessors
+/// below are pure forwards. An enum rather than `Box<dyn ...>` keeps the
+/// dispatch a branch on a tag instead of a vtable hop on every block read,
+/// and keeps the handle one allocation.
+#[derive(Debug)]
+pub struct Store(Inner);
+
+#[derive(Debug)]
+enum Inner {
+    Uncached(CoreStore),
+    Cached(CachedStore),
+}
+
+/// Forwards a method call to whichever store the handle holds. Both arms are
+/// always the same call, so writing them out per method would be five copies
+/// of one `match`.
+macro_rules! forward {
+    ($self:ident.$method:ident($($arg:expr),*)) => {
+        match &$self.0 {
+            Inner::Uncached(store) => store.$method($($arg),*),
+            Inner::Cached(store) => store.$method($($arg),*),
+        }
+    };
+}
+
+impl Store {
+    fn write_block(&self, height: BlockHeight, data: &[u8]) -> Result<(), IoError> {
+        forward!(self.write_block(height, data))
+    }
+
+    fn read_block(&self, height: BlockHeight) -> Result<Option<Block>, IoError> {
+        forward!(self.read_block(height))
+    }
+
+    fn max_contiguous_height(&self) -> BlockHeight {
+        forward!(self.max_contiguous_height())
+    }
+
+    fn height_highwater(&self) -> BlockHeight {
+        forward!(self.height_highwater())
+    }
+
+    fn min_block_height(&self) -> BlockHeight {
+        forward!(self.min_block_height())
+    }
+}
+
 /// Arguments for opening or creating a [`Store`]. Passed to [`bs_open_store`].
 #[repr(C)]
 #[allow(clippy::arbitrary_source_item_ordering)]
@@ -52,7 +106,16 @@ pub struct StoreArgs<'a> {
     /// The filesystem path used for both the index and the data files. Must
     /// be valid UTF-8.
     pub path: BorrowedBytes<'a>,
-    /// Read cache size, in bytes. Must be greater than zero.
+    /// Byte budget for the LRU read cache. `0` opens the store without a
+    /// cache, so every read goes to the index and data files; any other
+    /// value caps the cache's tracked heap occupancy at that many bytes.
+    ///
+    /// A non-zero budget costs concurrency. The LRU sits behind a single
+    /// mutex that every read and every write takes exclusively -- a cache
+    /// hit still has to update recency order -- so cached reads and writes
+    /// serialise against each other, while the uncached read path takes no
+    /// lock at all. Prefer `0` when many threads read and write distinct
+    /// heights; prefer a budget when the workload re-reads a working set.
     pub cache_size: usize,
     /// Maximum size of a single data file in bytes. `0` means unlimited
     /// (single-file mode); any other value caps each `blockdb_N.dat` file
@@ -90,25 +153,26 @@ pub extern "C" fn bs_open_store(args: StoreArgs<'_>) -> StoreHandleResult {
             .as_str()
             .map_err(|e| IoError::new(ErrorKind::InvalidData, e))?;
         let path: &Path = OsStr::from_bytes(path_str.as_bytes()).as_ref();
-        let cache_size = NonZeroUsize::new(args.cache_size)
-            .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "cache_size must be > 0"))?;
         let max_data_files = if args.max_data_files == 0 {
             DEFAULT_MAX_DATA_FILES
         } else {
             args.max_data_files
         };
-        Store::open(
-            path,
-            path,
-            StoreOptions {
-                cache_size,
-                truncate: args.truncate,
-                sync: args.sync,
-                minimum_height: args.minimum_height,
-                max_data_file_size: NonZeroU64::new(args.max_data_file_size),
-                max_data_files,
-            },
-        )
+        // `StoreOptions::cache_size` is only read by `CachedStore`, so the
+        // uncached branch needs a value it will never look at.
+        let cache_size = NonZeroUsize::new(args.cache_size);
+        let options = StoreOptions {
+            cache_size: cache_size.unwrap_or(NonZeroUsize::MIN),
+            truncate: args.truncate,
+            sync: args.sync,
+            minimum_height: args.minimum_height,
+            max_data_file_size: NonZeroU64::new(args.max_data_file_size),
+            max_data_files,
+        };
+        Ok(match cache_size {
+            Some(_) => Store(Inner::Cached(CachedStore::open(path, path, options)?)),
+            None => Store(Inner::Uncached(CoreStore::open(path, path, options)?)),
+        })
     })
 }
 

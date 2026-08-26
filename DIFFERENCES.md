@@ -30,7 +30,10 @@ guarantee.
 which evicts oldest entries until the total tracked heap occupancy
 stays under a *byte budget* (`StoreOptions::cache_size: NonZeroUsize`,
 in bytes). Block sizes vary; the byte budget gives a hard
-memory-pressure bound regardless of which blocks are hot.
+memory-pressure bound regardless of which blocks are hot. Go callers
+reach it through `StoreConfig.CacheSize` (also bytes; `0` opens the
+store with no cache at all, which blockdb's entry count cannot
+express).
 
 **Why it's useful:** Operators can size the cache by "how much RAM I'm
 willing to spend on block caching" — a number they can actually reason

@@ -25,8 +25,9 @@ type Store struct {
 
 // OpenRustStore opens (or creates) a Rust-backed store. Unset fields on
 // cfg take their natural defaults: MaxDataFileSize=0 selects single-file
-// mode, MaxDataFiles=0 selects the Rust-side default. MinimumHeight is the
-// exception: 0 is a real minimum height, not a default.
+// mode, MaxDataFiles=0 selects the Rust-side default, CacheSize=0 opens the
+// store with no read cache. MinimumHeight is the exception: 0 is a real
+// minimum height, not a default.
 func OpenRustStore(cfg StoreConfig) (*Store, error) {
 	pinner := runtime.Pinner{}
 	defer pinner.Unpin()
@@ -34,7 +35,7 @@ func OpenRustStore(cfg StoreConfig) (*Store, error) {
 	pathBytes := []byte(cfg.Path)
 	args := C.struct_StoreArgs{
 		path:               newBorrowedBytes(pathBytes, &pinner),
-		cache_size:         C.size_t(64 * 1024 * 1024),
+		cache_size:         C.size_t(cfg.CacheSize),
 		max_data_file_size: C.uint64_t(cfg.MaxDataFileSize),
 		minimum_height:     C.uint64_t(cfg.MinimumHeight),
 		max_data_files:     C.size_t(cfg.MaxDataFiles),
@@ -55,6 +56,9 @@ func NewRustStore(path string, sync SyncMode) (*Store, error) {
 		Truncate: true,
 		// Explicit: this shim's blocks have always started at height 1.
 		MinimumHeight: 1,
+		// No read cache, matching what this shim has always got: the
+		// cache_size it used to pass was ignored by the Rust side.
+		CacheSize: 0,
 	})
 }
 

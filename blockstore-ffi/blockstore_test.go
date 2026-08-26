@@ -109,6 +109,48 @@ func TestMinimumHeight(t *testing.T) {
 	}
 }
 
+// TestCacheSize exercises the cached variant end to end: a non-zero
+// CacheSize makes bs_open_store wrap the store in the LRU read cache, so
+// every accessor has to forward through the cache rather than the plain
+// store.
+func TestCacheSize(t *testing.T) {
+	dir, err := os.MkdirTemp("", "blockstore_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	store, err := OpenRustStore(StoreConfig{
+		Path:          dir,
+		Sync:          Async,
+		Truncate:      true,
+		MinimumHeight: 1,
+		CacheSize:     1 << 20,
+	})
+	require.NoError(t, err)
+	defer store.Close()
+
+	data := []byte("cached block")
+	for _, height := range []uint64{1, 2, 4} {
+		require.NoError(t, store.WriteBlock(Block{Height: height, Data: data}))
+	}
+
+	// The write populated the cache, so the first read is a hit and the
+	// second one re-reads the same entry. Both must return the same bytes.
+	for range 2 {
+		block, err := store.ReadBlock(2)
+		require.NoError(t, err)
+		assert.Equal(t, data, block)
+	}
+
+	// A height that was never written is still absent through the cache.
+	missing, err := store.ReadBlock(3)
+	require.NoError(t, err)
+	assert.Nil(t, missing)
+
+	assert.Equal(t, uint64(2), store.MaxContiguousHeight())
+	assert.Equal(t, uint64(4), store.HeightHighwater())
+	assert.Equal(t, uint64(1), store.MinBlockHeight())
+}
+
 // ExampleOpenRustStore documents the StoreConfig surface for Go callers.
 // The multi-file algorithm itself is covered by the Rust unit tests; this
 // just shows how to wire up the options.
@@ -126,6 +168,7 @@ func ExampleOpenRustStore() {
 		MaxDataFileSize: 1 << 30, // 1 GiB per blockdb_N.dat (0 = unlimited)
 		MaxDataFiles:    16,      // open-fd cache size (0 = default)
 		MinimumHeight:   1,       // first accepted height (0 = height 0, not a default)
+		CacheSize:       1 << 26, // 64 MiB read cache (0 = no cache)
 	})
 	if err != nil {
 		log.Fatal(err)
