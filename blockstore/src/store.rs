@@ -75,8 +75,6 @@ pub enum SyncMode {
 
 #[derive(Debug)]
 pub struct Store {
-    // TODO: add a recent block cache here
-    // recents: crate::recents::Recents,
     index_file: File,
     files: FileSet,
     data_highwater: Mutex<u64>,
