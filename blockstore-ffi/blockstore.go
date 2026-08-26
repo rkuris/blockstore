@@ -9,6 +9,10 @@ package blockstore
 // #cgo nocallback bs_read_block
 // #cgo noescape bs_max_contiguous_height
 // #cgo nocallback bs_max_contiguous_height
+// #cgo noescape bs_height_highwater
+// #cgo nocallback bs_height_highwater
+// #cgo noescape bs_min_block_height
+// #cgo nocallback bs_min_block_height
 import "C"
 
 import (
@@ -66,6 +70,19 @@ func (s *Store) ReadBlock(height uint64) ([]byte, error) {
 
 func (s *Store) MaxContiguousHeight() uint64 {
 	return uint64(C.bs_max_contiguous_height(s.handle))
+}
+
+// HeightHighwater returns the highest height ever written, regardless of
+// contiguity. It diverges from MaxContiguousHeight when blocks are written
+// with gaps below them.
+func (s *Store) HeightHighwater() uint64 {
+	return uint64(C.bs_height_highwater(s.handle))
+}
+
+// MinBlockHeight returns the store's configured first height, i.e. the
+// lowest height it will accept a block at.
+func (s *Store) MinBlockHeight() uint64 {
+	return uint64(C.bs_min_block_height(s.handle))
 }
 
 func (s *Store) Close() error {

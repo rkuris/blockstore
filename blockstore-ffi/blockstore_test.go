@@ -46,6 +46,29 @@ func TestSmoke(t *testing.T) {
 	}
 }
 
+// TestHeightAccessors writes blocks with a gap so that the three height
+// accessors report three different values.
+func TestHeightAccessors(t *testing.T) {
+	dir, err := os.MkdirTemp("", "blockstore_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	store, err := NewRustStore(dir, Async)
+	require.NoError(t, err)
+	defer store.Close()
+
+	data := []byte("block")
+	for _, height := range []uint64{1, 2, 5} {
+		require.NoError(t, store.WriteBlock(Block{Height: height, Data: data}))
+	}
+
+	// Contiguity stalls below the gap at height 3, the highwater tracks
+	// every write, and the minimum is whatever the store was opened with.
+	assert.Equal(t, uint64(2), store.MaxContiguousHeight())
+	assert.Equal(t, uint64(5), store.HeightHighwater())
+	assert.Equal(t, uint64(1), store.MinBlockHeight())
+}
+
 // ExampleOpenRustStore documents the StoreConfig surface for Go callers.
 // The multi-file algorithm itself is covered by the Rust unit tests; this
 // just shows how to wire up the options.

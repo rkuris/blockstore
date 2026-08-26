@@ -163,6 +163,27 @@ pub extern "C" fn bs_max_contiguous_height(store: Option<&Store>) -> BlockHeight
     }
 }
 
+/// Returns the highest block height ever written to the store regardless of
+/// contiguity, or 0 if `store` is null. Diverges from
+/// [`bs_max_contiguous_height`] when blocks are written with gaps below them.
+#[unsafe(no_mangle)]
+pub extern "C" fn bs_height_highwater(store: Option<&Store>) -> BlockHeight {
+    match store {
+        Some(store) => store.height_highwater(),
+        None => 0,
+    }
+}
+
+/// Returns the store's configured first height (the lowest height it will
+/// accept a block at), or 0 if `store` is null.
+#[unsafe(no_mangle)]
+pub extern "C" fn bs_min_block_height(store: Option<&Store>) -> BlockHeight {
+    match store {
+        Some(store) => store.min_block_height(),
+        None => 0,
+    }
+}
+
 /// Frees memory associated with an [`OwnedBytes`] previously returned from an
 /// FFI call.
 #[unsafe(no_mangle)]

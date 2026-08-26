@@ -38,5 +38,7 @@ type StoreInterface interface {
 	WriteBlock(block Block) error
 	ReadBlock(height uint64) ([]byte, error)
 	MaxContiguousHeight() uint64
+	HeightHighwater() uint64
+	MinBlockHeight() uint64
 	Close() error
 }

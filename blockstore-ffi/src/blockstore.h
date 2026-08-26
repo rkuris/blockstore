@@ -258,10 +258,23 @@ struct VoidResult bs_close_store(struct Store *store);
 struct VoidResult bs_free_owned_bytes(OwnedBytes bytes);
 
 /**
+ * Returns the highest block height ever written to the store regardless of
+ * contiguity, or 0 if `store` is null. Diverges from
+ * [`bs_max_contiguous_height`] when blocks are written with gaps below them.
+ */
+BlockHeight bs_height_highwater(const struct Store *store);
+
+/**
  * Returns the maximum contiguous block height of the store, or 0 if `store`
  * is null.
  */
 BlockHeight bs_max_contiguous_height(const struct Store *store);
+
+/**
+ * Returns the store's configured first height (the lowest height it will
+ * accept a block at), or 0 if `store` is null.
+ */
+BlockHeight bs_min_block_height(const struct Store *store);
 
 /**
  * Opens (or creates) a [`Store`].
