@@ -7,21 +7,24 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 authors = ["Ron Kuris <swcafe@gmail.com>"]
 license-file = "LICENSE.md"
 readme = "README.md"
 
 [workspace.dependencies]
-bytemuck = { version = "1.13.1", features = ["derive"] }
-xxhash-rust = { version = "0.8.10", features = ["xxh64"] }
-tempfile = "3.20.0"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+xxhash-rust = { version = "0.8.18", features = ["xxh64"] }
+tempfile = "3.27.0"
 more-asserts = "0.3.1"
+# Pinned to 0.5.x: pprof 0.15 (latest) builds its criterion integration
+# against criterion 0.5, so 0.8 puts two criterion versions in the graph and
+# `PProfProfiler` no longer satisfies the `Profiler` trait the bench needs.
 criterion = { version = "0.5.1", features = ["html_reports"] }
 pprof = { version = "0.15.0", features = ["flamegraph", "criterion"] }
-cbindgen = "0.29.0"
-strum = { version = "0.27", features = ["derive"] }
+cbindgen = "0.29.4"
+strum = { version = "0.28", features = ["derive"] }
 
 [workspace.lints.clippy]
 pedantic = "warn"
