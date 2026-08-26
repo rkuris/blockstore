@@ -690,7 +690,10 @@ impl Store {
             }
             let entries_read = n / ENTRY_SIZE;
             let chunk = buf.get(..n).ok_or_else(overflow)?;
-            for (i, entry_bytes) in chunk.chunks_exact(ENTRY_SIZE).enumerate() {
+            // `n` is a whole multiple of `ENTRY_SIZE` (checked just above),
+            // so the remainder half of `as_chunks` is always empty and the
+            // chunk iterator covers every byte read.
+            for (i, entry_bytes) in chunk.as_chunks::<ENTRY_SIZE>().0.iter().enumerate() {
                 let height = height_cursor.checked_add(i as u64).ok_or_else(overflow)?;
                 if height > upper_bound {
                     return Ok(last_present);
